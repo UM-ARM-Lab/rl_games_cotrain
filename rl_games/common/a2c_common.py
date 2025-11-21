@@ -15,6 +15,7 @@ from rl_games.interfaces.base_algorithm import  BaseAlgorithm
 import numpy as np
 import time
 import gym
+from tqdm import tqdm, trange
 
 from datetime import datetime
 from tensorboardX import SummaryWriter
@@ -734,7 +735,7 @@ class A2CBase(BaseAlgorithm):
 
         step_time = 0.0
 
-        for n in range(self.horizon_length):
+        for n in trange(self.horizon_length, leave=False, desc="Playing steps"):
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
@@ -798,7 +799,7 @@ class A2CBase(BaseAlgorithm):
         mb_rnn_states = self.mb_rnn_states
         step_time = 0.0
 
-        for n in range(self.horizon_length):
+        for n in trange(self.horizon_length, leave=False, desc="Playing steps"):
             if n % self.seq_length == 0:
                 for s, mb_s in zip(self.rnn_states, mb_rnn_states):
                     mb_s[n // self.seq_length,:,:,:] = s
@@ -1313,7 +1314,7 @@ class ContinuousA2CBase(A2CBase):
             dist.broadcast_object_list(model_params, 0)
             self.model.load_state_dict(model_params[0])
 
-        while True:
+        for _ in trange(self.max_epochs):
             epoch_num = self.update_epoch()
             step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time

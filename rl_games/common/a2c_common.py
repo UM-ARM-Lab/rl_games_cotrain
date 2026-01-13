@@ -8,6 +8,7 @@ from rl_games.algos_torch.self_play_manager import SelfPlayManager
 from rl_games.algos_torch import torch_ext
 from rl_games.common import schedulers
 from rl_games.common.experience import ExperienceBuffer
+from rl_games.common.dual_experience import DualExperienceBuffer
 from rl_games.common.interval_summary_writer import IntervalSummaryWriter
 from rl_games.common.diagnostics import DefaultDiagnostics, PpoDiagnostics
 from rl_games.algos_torch import  model_builder
@@ -85,6 +86,9 @@ class A2CBase(BaseAlgorithm):
         self.algo_observer = config['features']['observer']
         self.algo_observer.before_init(base_name, config, self.experiment_name)
         self.load_networks(params)
+
+        # Initialize cotrain flag (will be properly set in init_tensors)
+        self.cotrain_enabled = config.get('cotrain', {}).get('enabled', False)
 
         self.multi_gpu = config.get('multi_gpu', False)
 
@@ -457,7 +461,33 @@ class A2CBase(BaseAlgorithm):
             'has_central_value' : self.has_central_value,
             'use_action_masks' : self.use_action_masks
         }
-        self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
+
+        # Check for cotrain configuration
+        cotrain_cfg = self.config.get('cotrain', {})
+        self.cotrain_enabled = cotrain_cfg.get('enabled', False)
+
+        if self.cotrain_enabled:
+            # Create DualExperienceBuffer for co-training
+            num_real_envs = cotrain_cfg.get('num_real_envs', self.num_actors // 32)
+            real_data_ratio = cotrain_cfg.get('real_data_ratio', 0.3)
+            temperature = cotrain_cfg.get('temperature', 1.0)
+
+            # Get dynamics scorer if provided
+            dynamics_scorer = cotrain_cfg.get('dynamics_scorer', None)
+
+            self.experience_buffer = DualExperienceBuffer(
+                env_info=self.env_info,
+                algo_info=algo_info,
+                device=self.ppo_device,
+                num_real_envs=num_real_envs,
+                num_total_envs=self.num_actors,
+                real_data_ratio=real_data_ratio,
+                dynamics_scorer=dynamics_scorer,
+                temperature=temperature,
+            )
+            print(f"[Cotrain] Using DualExperienceBuffer with real_data_ratio={real_data_ratio}")
+        else:
+            self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
 
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)
@@ -787,10 +817,18 @@ class A2CBase(BaseAlgorithm):
         mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
 
+        # Compute reliability scores for cotrain before weighted sampling
+        if self.cotrain_enabled:
+            self.experience_buffer.compute_sim_reliability()
+
         batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
         batch_dict['returns'] = swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
         batch_dict['step_time'] = step_time
+
+        # Add cotrain stats for logging
+        if self.cotrain_enabled:
+            batch_dict['cotrain_stats'] = self.experience_buffer.get_reliability_stats()
 
         return batch_dict
 
@@ -868,6 +906,11 @@ class A2CBase(BaseAlgorithm):
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
+
+        # Compute reliability scores for cotrain before weighted sampling
+        if self.cotrain_enabled:
+            self.experience_buffer.compute_sim_reliability()
+
         batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
 
         batch_dict['returns'] = swap_and_flatten01(mb_returns)
@@ -880,6 +923,10 @@ class A2CBase(BaseAlgorithm):
 
         batch_dict['rnn_states'] = states
         batch_dict['step_time'] = step_time
+
+        # Add cotrain stats for logging
+        if self.cotrain_enabled:
+            batch_dict['cotrain_stats'] = self.experience_buffer.get_reliability_stats()
 
         return batch_dict
 
@@ -1186,6 +1233,9 @@ class ContinuousA2CBase(A2CBase):
         update_time_start = time.time()
         rnn_masks = batch_dict.get('rnn_masks', None)
 
+        # Extract cotrain stats before prepare_dataset modifies batch_dict
+        cotrain_stats = batch_dict.pop('cotrain_stats', None)
+
         self.set_train()
         self.curr_frames = batch_dict.pop('played_frames')
         self.prepare_dataset(batch_dict)
@@ -1237,7 +1287,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, cotrain_stats
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1316,12 +1366,17 @@ class ContinuousA2CBase(A2CBase):
 
         for _ in trange(self.max_epochs):
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, cotrain_stats = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
             # cleaning memory to optimize space
             self.dataset.update_values_dict(None)
+
+            # Reset cotrain scores for next epoch
+            if self.cotrain_enabled:
+                self.experience_buffer.reset_scores()
+
             should_exit = False
 
             if self.global_rank == 0:
@@ -1332,7 +1387,7 @@ class ContinuousA2CBase(A2CBase):
                 curr_frames = self.curr_frames * self.world_size if self.multi_gpu else self.curr_frames
                 self.frame += curr_frames
 
-                print_statistics(self.print_stats, curr_frames, step_time, scaled_play_time, scaled_time, 
+                print_statistics(self.print_stats, curr_frames, step_time, scaled_play_time, scaled_time,
                                 epoch_num, self.max_epochs, frame, self.max_frames)
 
                 self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
@@ -1341,6 +1396,11 @@ class ContinuousA2CBase(A2CBase):
 
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+
+                # Log cotrain statistics
+                if cotrain_stats is not None:
+                    for key, value in cotrain_stats.items():
+                        self.writer.add_scalar(key, value, frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)

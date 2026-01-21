@@ -113,6 +113,7 @@ class Runner:
         agent = self.algo_factory.create(self.algo_name, base_name='run', params=self.params)
         _restore(agent, args)
         _override_sigma(agent, args)
+        self.algo = agent
         agent.train()
 
     def run_play(self, args):

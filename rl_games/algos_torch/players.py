@@ -8,6 +8,12 @@ from torch import nn
 import numpy as np
 
 
+def _resolve_checkpoint(checkpoint_or_path):
+    if isinstance(checkpoint_or_path, dict):
+        return checkpoint_or_path
+    return torch_ext.load_checkpoint(checkpoint_or_path)
+
+
 def rescale_actions(low, high, action):
     d = (high - low) / 2.0
     m = (high + low) / 2.0
@@ -69,8 +75,8 @@ class PpoPlayerContinuous(BasePlayer):
         else:
             return current_action
 
-    def restore(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
+    def restore(self, checkpoint_or_path):
+        checkpoint = _resolve_checkpoint(checkpoint_or_path)
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
@@ -173,8 +179,8 @@ class PpoPlayerDiscrete(BasePlayer):
             else:    
                 return action.squeeze().detach()
 
-    def restore(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
+    def restore(self, checkpoint_or_path):
+        checkpoint = _resolve_checkpoint(checkpoint_or_path)
         self.model.load_state_dict(checkpoint['model'])
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
@@ -214,8 +220,8 @@ class SACPlayer(BasePlayer):
         self.model.eval()
         self.is_rnn = self.model.is_rnn()
 
-    def restore(self, fn):
-        checkpoint = torch_ext.load_checkpoint(fn)
+    def restore(self, checkpoint_or_path):
+        checkpoint = _resolve_checkpoint(checkpoint_or_path)
         self.model.sac_network.actor.load_state_dict(checkpoint['actor'])
         self.model.sac_network.critic.load_state_dict(checkpoint['critic'])
         self.model.sac_network.critic_target.load_state_dict(checkpoint['critic_target'])

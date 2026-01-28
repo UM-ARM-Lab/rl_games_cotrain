@@ -29,6 +29,9 @@ from time import sleep
 from rl_games.common import common_losses
 
 
+
+
+
 def swap_and_flatten01(arr):
     """
     swap and then flatten axes 0 and 1
@@ -472,8 +475,9 @@ class A2CBase(BaseAlgorithm):
             real_data_ratio = cotrain_cfg.get('real_data_ratio', 0.3)
             temperature = cotrain_cfg.get('temperature', 1.0)
 
-            # Get dynamics scorer if provided
+            # Get dynamics scorer or trajectory resampler if provided
             dynamics_scorer = cotrain_cfg.get('dynamics_scorer', None)
+            traj_resampler = cotrain_cfg.get('traj_resampler', None)
 
             self.experience_buffer = DualExperienceBuffer(
                 env_info=self.env_info,
@@ -483,7 +487,9 @@ class A2CBase(BaseAlgorithm):
                 num_total_envs=self.num_actors,
                 real_data_ratio=real_data_ratio,
                 dynamics_scorer=dynamics_scorer,
+                traj_resampler=traj_resampler,
                 temperature=temperature,
+                writer=self.writer,
             )
             print(f"[Cotrain] Using DualExperienceBuffer with real_data_ratio={real_data_ratio}")
         else:
@@ -814,21 +820,17 @@ class A2CBase(BaseAlgorithm):
         mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
         mb_values = self.experience_buffer.tensor_dict['values']
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
-        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
+        mb_masks = self.experience_buffer.tensor_dict.get('mask', None)
+        if mb_masks is not None:
+            mb_advs = self.discount_values_masks(fdones, last_values, mb_fdones, mb_values, mb_rewards, mb_masks.float())
+        else:
+            mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
-
-        # Compute reliability scores for cotrain before weighted sampling
-        if self.cotrain_enabled:
-            self.experience_buffer.compute_sim_reliability()
 
         batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
         batch_dict['returns'] = swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
         batch_dict['step_time'] = step_time
-
-        # Add cotrain stats for logging
-        if self.cotrain_enabled:
-            batch_dict['cotrain_stats'] = self.experience_buffer.get_reliability_stats()
 
         return batch_dict
 
@@ -901,15 +903,14 @@ class A2CBase(BaseAlgorithm):
 
         fdones = self.dones.float()
         mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
-
         mb_values = self.experience_buffer.tensor_dict['values']
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
-        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
+        mb_masks = self.experience_buffer.tensor_dict.get('mask', None)
+        if mb_masks is not None:
+            mb_advs = self.discount_values_masks(fdones, last_values, mb_fdones, mb_values, mb_rewards, mb_masks.float())
+        else:
+            mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
-
-        # Compute reliability scores for cotrain before weighted sampling
-        if self.cotrain_enabled:
-            self.experience_buffer.compute_sim_reliability()
 
         batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
 
@@ -923,10 +924,6 @@ class A2CBase(BaseAlgorithm):
 
         batch_dict['rnn_states'] = states
         batch_dict['step_time'] = step_time
-
-        # Add cotrain stats for logging
-        if self.cotrain_enabled:
-            batch_dict['cotrain_stats'] = self.experience_buffer.get_reliability_stats()
 
         return batch_dict
 
@@ -1233,9 +1230,6 @@ class ContinuousA2CBase(A2CBase):
         update_time_start = time.time()
         rnn_masks = batch_dict.get('rnn_masks', None)
 
-        # Extract cotrain stats before prepare_dataset modifies batch_dict
-        cotrain_stats = batch_dict.pop('cotrain_stats', None)
-
         self.set_train()
         self.curr_frames = batch_dict.pop('played_frames')
         self.prepare_dataset(batch_dict)
@@ -1287,7 +1281,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, cotrain_stats
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1366,7 +1360,7 @@ class ContinuousA2CBase(A2CBase):
 
         for _ in trange(self.max_epochs):
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, cotrain_stats = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -1396,11 +1390,6 @@ class ContinuousA2CBase(A2CBase):
 
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
-
-                # Log cotrain statistics
-                if cotrain_stats is not None:
-                    for key, value in cotrain_stats.items():
-                        self.writer.add_scalar(key, value, frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)

@@ -80,10 +80,32 @@ class SACAgent(BaseAlgorithm):
                                                     lr=float(self.config["alpha_lr"]),
                                                     betas=self.config.get("alphas_betas", [0.9, 0.999]))
 
-        self.replay_buffer = experience.VectorizedReplayBuffer(self.env_info['observation_space'].shape,
-        self.env_info['action_space'].shape,
-        self.replay_buffer_size,
-        self._device)
+        # Co-training configuration
+        cotrain_cfg = self.config.get('cotrain', {})
+        self.cotrain_enabled = cotrain_cfg.get('enabled', False)
+        if self.cotrain_enabled:
+            num_real_envs = cotrain_cfg.get('num_real_envs', 0)
+            num_sim_envs = self.num_actors - num_real_envs
+            self.replay_buffer = experience.CotrainVectorizedReplayBuffer(
+                obs_shape=self.env_info['observation_space'].shape,
+                action_shape=self.env_info['action_space'].shape,
+                capacity=self.replay_buffer_size,
+                device=self._device,
+                num_sim_envs=num_sim_envs,
+                num_total_envs=self.num_actors,
+                real_data_ratio=cotrain_cfg.get('real_data_ratio', 0.3),
+                traj_resampler=cotrain_cfg.get('traj_resampler', None),
+                score_batch_size=cotrain_cfg.get('score_batch_size', 32),
+                train_scorer=cotrain_cfg.get('train_scorer', False),
+                writer=self.writer,
+            )
+        else:
+            self.replay_buffer = experience.VectorizedReplayBuffer(
+                self.env_info['observation_space'].shape,
+                self.env_info['action_space'].shape,
+                self.replay_buffer_size,
+                self._device,
+            )
         self.target_entropy_coef = config.get("target_entropy_coef", 1.0)
         self.target_entropy = self.target_entropy_coef * -self.env_info['action_space'].shape[0]
         print("Target entropy", self.target_entropy)
@@ -570,6 +592,13 @@ class SACAgent(BaseAlgorithm):
                 self.writer.add_scalar('info/alpha', torch_ext.mean_list(alphas).item(), self.frame)
 
             self.writer.add_scalar('info/epochs', self.epoch_num, self.frame)
+
+            # Log co-training stats
+            if self.cotrain_enabled and hasattr(self.replay_buffer, 'get_stats'):
+                cotrain_stats = self.replay_buffer.get_stats()
+                for key, value in cotrain_stats.items():
+                    self.writer.add_scalar(key, value, self.frame)
+
             self.algo_observer.after_print_stats(self.frame, self.epoch_num, total_time)
 
             if self.game_rewards.current_size > 0:

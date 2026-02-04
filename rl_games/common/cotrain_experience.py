@@ -13,7 +13,7 @@ Key features:
 
 import torch
 import numpy as np
-from typing import Optional, Dict, Callable
+from typing import Optional, Dict, Callable, Tuple, Union
 from rl_games.common.experience import ExperienceBuffer
 
 """
@@ -55,15 +55,25 @@ class TrajResamplerInterface(ABC):
         """
         pass
 
-    def train_step(self, tensor_dict) -> Union[float, Tuple[float, dict]]:
+    def scorer_train_step(self, tensor_dict) -> Optional[Tuple[float, dict]]:
         """
-        Optional training step for the dynamics scorer.
+        Optional training/update step for the scorer.
+
+        Called after each rollout collection in the RL loop.
+        - For trainable scorers (DynamicsScorer): performs gradient update
+        - For non-trainable (DTWScorer): may update prototypes or statistics
+
         Args:
-            states: (B, T, state_dim)
-            actions: (B, T, action_dim)
-            next_states: (B, T, state_dim)
+            tensor_dict: Dictionary containing trajectory data with shape (T, num_envs, ...):
+                - 'obses': observations (dict or tensor)
+                - 'actions': (T, num_envs, action_dim)
+                - 'rewards': (T, num_envs, value_size)
+                - 'dones': (T, num_envs)
+
+        Returns:
+            None, or tuple of (loss, metrics_dict) for logging
         """
-        pass
+        return None
 
 
 def swap_and_flatten01(arr):
@@ -268,9 +278,15 @@ class CotrainExperienceBuffer:
 
         sim_tensor_dict = self.sim_buffer.tensor_dict
 
-        train_step = getattr(self.traj_resampler, 'train_step', None)
-        if callable(train_step):
-            train_step(sim_tensor_dict)
+        # Call scorer training (renamed from train_step to scorer_train_step)
+        scorer_train_step = getattr(self.traj_resampler, 'scorer_train_step', None)
+        if callable(scorer_train_step):
+            result = scorer_train_step(sim_tensor_dict)
+            if result is not None:
+                loss, metrics = result
+                if self.writer is not None:
+                    for key, value in metrics.items():
+                        self.writer.add_scalar(key, value, self._log_step)
 
         mask = self.traj_resampler.resample(sim_tensor_dict)
 

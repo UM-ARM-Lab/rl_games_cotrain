@@ -103,33 +103,27 @@ class Runner:
         config['features']['observer'] = self.algo_observer
         self.params = params
 
-    def load(self, yaml_config, set_agent=True, set_player=True):
+    def load(self, yaml_config):
         config = deepcopy(yaml_config)
         self.default_config = deepcopy(config['params'])
         self.load_config(params=self.default_config)
 
-        # Create both algo and player, and delete upon function call
-        self.agent = self.algo_factory.create(
-            self.algo_name, base_name='run', params=self.params
-        ) if set_agent else None
-        self.player = self.player_factory.create(
-            self.algo_name, params=self.params
-        ) if set_player else None
-
-    def reset(self):
-        return
+    def create_player(self):
+        return self.player_factory.create(self.algo_name, params=self.params)
 
     def run_train(self, args):
         print('Started to train')
-        _restore(self.agent, args)
-        _override_sigma(self.agent, args)
-        self.agent.train()
+        agent = self.algo_factory.create(self.algo_name, base_name='run', params=self.params)
+        _restore(agent, args)
+        _override_sigma(agent, args)
+        agent.train()
 
     def run_play(self, args):
         print('Started to play')
-        _restore(self.player, args)
-        _override_sigma(self.player, args)
-        self.player.run()
+        player = self.create_player()
+        _restore(player, args)
+        _override_sigma(player, args)
+        player.run()
 
     def run(self, args):
         if args['train']:
@@ -138,32 +132,3 @@ class Runner:
             self.run_play(args)
         else:
             self.run_train(args)
-
-
-class TrainEvalRunner(Runner):
-    def __init__(self, algo_observer=None):
-        super().__init__(algo_observer)
-
-    def get_train_agent(self):
-        return self.agent
-
-    def get_eval_player(self):
-        return self.player
-
-    def sync_eval_player(self):
-        """Sync eval player weights from training agent if both exist."""
-        if self.agent is None or self.player is None:
-            return
-        self.player.model.load_state_dict(self.agent.model.state_dict())
-        if not self.player.normalize_input and hasattr(self.agent.model, 'running_mean_std'):
-            self.player.model.running_mean_std.load_state_dict(self.agent.model.running_mean_std.state_dict())
-
-    def run_train(self, args):
-        """
-        A variant of runner that supports training and evaluation
-
-        # Just do NOT delete the player upon training
-        """
-        _restore(self.agent, args)
-        _override_sigma(self.agent, args)
-        self.agent.train()

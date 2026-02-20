@@ -1671,6 +1671,3 @@ class ContinuousA2CBase(A2CBase):
                 should_exit = should_exit_t.float().item()
             if should_exit:
                 return self.last_mean_rewards, epoch_num
-
-            if should_exit:
-                return self.last_mean_rewards, epoch_num

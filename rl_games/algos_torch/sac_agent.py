@@ -8,17 +8,21 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.tensorboard import SummaryWriter
 
+from tqdm import tqdm, trange
+
 from rl_games.algos_torch import model_builder, torch_ext
 from rl_games.common import experience, schedulers, vecenv
 from rl_games.common.a2c_common import print_statistics
 from rl_games.interfaces.base_algorithm import BaseAlgorithm
 
 
+
+
 class SACAgent(BaseAlgorithm):
     def __init__(self, base_name, params):
 
         self.config = config = params["config"]
-        print(config)
+        # print(config)
 
         # TODO: Get obs shape and self.network
         self.load_networks(params)
@@ -119,7 +123,7 @@ class SACAgent(BaseAlgorithm):
         self.env_config = config.get("env_config", {})
         self.num_actors = config.get("num_actors", 1)
         self.env_name = config["env_name"]
-        print("Env name:", self.env_name)
+        # print("Env name:", self.env_name)
 
         self.env_info = config.get("env_info")
         if self.env_info is None:
@@ -130,8 +134,8 @@ class SACAgent(BaseAlgorithm):
 
         # temporary for Isaac gym compatibility
         self.ppo_device = self._device
-        print("Env info:")
-        print(self.env_info)
+        # print("Env info:")
+        # print(self.env_info)
 
         self.rewards_shaper = config["reward_shaper"]
         self.observation_space = self.env_info["observation_space"]
@@ -481,7 +485,7 @@ class SACAgent(BaseAlgorithm):
 
         next_obs_processed = obs.clone()
 
-        for s in range(self.num_steps_per_episode):
+        for s in trange(self.num_steps_per_episode, desc="Steps"):
             self.set_eval()
             if random_exploration:
                 action = (
@@ -520,8 +524,13 @@ class SACAgent(BaseAlgorithm):
 
             if isinstance(next_obs, dict):
                 next_obs_processed = next_obs["obs"]
+            else:
+                next_obs_processed = next_obs
 
-            self.obs = next_obs.clone()
+            if isinstance(next_obs, dict):
+                self.obs = next_obs
+            else:
+                self.obs = next_obs.clone()
 
             rewards = self.rewards_shaper(rewards)
 
@@ -529,8 +538,7 @@ class SACAgent(BaseAlgorithm):
                 obs, action, torch.unsqueeze(rewards, 1), next_obs_processed, torch.unsqueeze(dones, 1)
             )
 
-            if isinstance(obs, dict):
-                obs = self.obs["obs"]
+            obs = next_obs_processed
 
             if not random_exploration:
                 self.set_train()
@@ -576,7 +584,7 @@ class SACAgent(BaseAlgorithm):
 
         self.obs = self.env_reset()
 
-        while True:
+        for _ in tqdm(range(self.max_epochs), desc="Training epochs"):
             self.epoch_num += 1
             (
                 step_time,

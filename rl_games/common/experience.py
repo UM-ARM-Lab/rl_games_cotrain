@@ -283,6 +283,10 @@ class VectorizedReplayBuffer:
         return obses, actions, rewards, next_obses, dones
 
 
+# Re-export so that sac_agent.py's `experience.CotrainVectorizedReplayBuffer` resolves.
+from rl_games.common.cotrain_experience import CotrainVectorizedReplayBuffer  # noqa: E402, F401
+
+
 class ExperienceBuffer:
     """
     More generalized than replay buffers.

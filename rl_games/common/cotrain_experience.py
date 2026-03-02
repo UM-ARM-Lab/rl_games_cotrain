@@ -66,6 +66,24 @@ class RLGPPOTrajResampler(ABC):
         raise NotImplementedError("resample() must be implemented by subclass.")
 
     @abstractmethod
+    def score_episode(self, states: torch.Tensor, actions: torch.Tensor) -> float:
+        """
+        Score a single completed episode for SAC replay buffer weighting.
+
+        Called once per episode per sim environment when the done flag fires.
+        The score weights this episode's transitions during replay sampling.
+
+        Args:
+            states:  (T, state_dim) float tensor of observed states.
+            actions: (T, action_dim) float tensor of actions taken.
+
+        Returns:
+            score in [0, 1]. 1.0 = fully accept, 0.0 = reject.
+            Unfit scorers must return 1.0.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def scorer_train_step(self, tensor_dict) -> Optional[Tuple[float, dict]]:
         """
         Optional training/update step for the scorer.
@@ -95,7 +113,7 @@ class TrajResamplerRegistry:
     # Hard-coded algo -> interface mapping.
     ALGO_INTERFACE_MAP: Dict[str, Optional[type]] = {
         "ppo": RLGPPOTrajResampler,
-        "sac": None,
+        "sac": RLGPPOTrajResampler,
     }
 
     @classmethod
@@ -236,462 +254,184 @@ class CotrainExperienceBuffer:
         return self.buffer.tensor_dict
 
 
-# class CotrainVectorizedReplayBuffer:
-#     """
-#     Dual replay buffer for SAC co-training with trajectory-based reweighting.
-
-#     Manages two separate VectorizedReplayBuffer instances (sim and real) and
-#     provides trajectory-level scoring for weighted sampling from the sim buffer.
-
-#     This mirrors the PPO CotrainExperienceBuffer design while respecting SAC's
-#     off-policy requirements (circular buffer, batch scoring, weighted sampling).
-
-#     Environment layout:
-#         [0, num_sim_envs)           -> sim envs (scaled hole, easier)
-#         [num_sim_envs, num_total_envs) -> real envs (tight clearance)
-#     """
-
-#     def __init__(
-#         self,
-#         obs_shape: tuple,
-#         action_shape: tuple,
-#         capacity: int,
-#         device: torch.device,
-#         num_sim_envs: int,
-#         num_total_envs: int,
-#         real_data_ratio: float = 0.3,
-#         traj_resampler=None,
-#         score_batch_size: int = 16,
-#         train_scorer: bool = False,
-#         writer=None,
-#     ):
-#         """
-#         Args:
-#             obs_shape: Shape of observations
-#             action_shape: Shape of actions
-#             capacity: Total replay buffer capacity (split between sim/real)
-#             device: Torch device
-#             num_sim_envs: Number of sim environments (indices [0, num_sim_envs))
-#             num_total_envs: Total environments (num_sim_envs + num_real_envs)
-#             real_data_ratio: Fraction of batch from real buffer (0.3 = 30% real)
-#             traj_resampler: RLGPPOTrajResampler for scoring trajectories
-#             score_batch_size: Number of trajectories to accumulate before scoring
-#             train_scorer: If True, call scorer_train_step(); if False, inference only
-#             writer: SummaryWriter for logging
-#         """
-#         self.device = device
-#         self.obs_shape = obs_shape
-#         self.action_shape = action_shape
-#         self.capacity = capacity
-
-#         # Env counts
-#         self.num_sim_envs = num_sim_envs
-#         self.num_real_envs = num_total_envs - num_sim_envs
-#         self.num_total_envs = num_total_envs
-#         self.real_data_ratio = real_data_ratio
-
-#         # Scorer
-#         self.traj_resampler = traj_resampler
-#         self.score_batch_size = score_batch_size
-#         self.train_scorer = train_scorer
-#         self.writer = writer
-#         self._log_step = 0
-
-#         # Allocate capacity proportionally
-#         if self.num_real_envs > 0 and self.num_sim_envs > 0:
-#             sim_capacity = int(capacity * (1 - real_data_ratio))
-#             real_capacity = capacity - sim_capacity
-#         elif self.num_real_envs == 0:
-#             sim_capacity = capacity
-#             real_capacity = 0
-#         else:
-#             sim_capacity = 0
-#             real_capacity = capacity
-
-#         # Create internal buffers
-#         self.sim_buffer = (
-#             VectorizedReplayBuffer(obs_shape, action_shape, max(sim_capacity, 1), device) if sim_capacity > 0 else None
-#         )
-
-#         self.real_buffer = (
-#             VectorizedReplayBuffer(obs_shape, action_shape, max(real_capacity, 1), device)
-#             if real_capacity > 0
-#             else None
-#         )
-
-#         # Trajectory tracking for sim envs
-#         # Maps buffer index -> trajectory ID
-#         self.sim_traj_ids = torch.zeros(sim_capacity, dtype=torch.long, device=device) if sim_capacity > 0 else None
-#         self.sim_traj_scores = {}  # traj_id -> score
-#         self._next_traj_id = 0
-
-#         # Per-env current trajectory ID
-#         self._env_current_traj_id = (
-#             torch.zeros(num_sim_envs, dtype=torch.long, device=device) if num_sim_envs > 0 else None
-#         )
-
-#         # Trajectory accumulation for scoring
-#         self._pending_trajectories = []  # List of {obs, action, traj_id}
-#         self._env_traj_buffers = {i: {"obses": [], "actions": []} for i in range(num_sim_envs)}
-
-#         # Initialize trajectory IDs for each env
-#         if num_sim_envs > 0:
-#             for i in range(num_sim_envs):
-#                 self._env_current_traj_id[i] = self._next_traj_id
-#                 self._next_traj_id += 1
-
-#         print("[CotrainVectorizedReplayBuffer] Initialized:")
-#         print(f"  Sim envs: {num_sim_envs}, Real envs: {self.num_real_envs}")
-#         print(f"  Sim capacity: {sim_capacity}, Real capacity: {real_capacity}")
-#         print(f"  Real data ratio: {100 * real_data_ratio:.1f}%")
-#         print(f"  Scorer: {type(traj_resampler).__name__ if traj_resampler else 'None (uniform)'}")
-#         print(f"  Train scorer: {train_scorer}")
-
-#     @property
-#     def idx(self):
-#         """Current index for compatibility."""
-#         if self.sim_buffer is not None:
-#             return self.sim_buffer.idx
-#         elif self.real_buffer is not None:
-#             return self.real_buffer.idx
-#         return 0
-
-#     @property
-#     def full(self):
-#         """Whether buffer is full for compatibility."""
-#         if self.sim_buffer is not None:
-#             return self.sim_buffer.full
-#         elif self.real_buffer is not None:
-#             return self.real_buffer.full
-#         return False
-
-#     def add(self, obs, action, reward, next_obs, done):
-#         """
-#         Add transitions split by environment index.
-
-#         Args:
-#             obs: (num_total_envs, *obs_shape)
-#             action: (num_total_envs, *action_shape)
-#             reward: (num_total_envs, 1)
-#             next_obs: (num_total_envs, *obs_shape)
-#             done: (num_total_envs, 1)
-#         """
-#         # Split by env index: [sim][real]
-#         if self.num_sim_envs > 0 and self.sim_buffer is not None:
-#             sim_obs = obs[: self.num_sim_envs]
-#             sim_action = action[: self.num_sim_envs]
-#             sim_reward = reward[: self.num_sim_envs]
-#             sim_next_obs = next_obs[: self.num_sim_envs]
-#             sim_done = done[: self.num_sim_envs]
-
-#             # Track which buffer indices get which trajectory IDs
-#             self._add_sim_with_tracking(sim_obs, sim_action, sim_reward, sim_next_obs, sim_done)
-
-#         if self.num_real_envs > 0 and self.real_buffer is not None:
-#             real_obs = obs[self.num_sim_envs :]
-#             real_action = action[self.num_sim_envs :]
-#             real_reward = reward[self.num_sim_envs :]
-#             real_next_obs = next_obs[self.num_sim_envs :]
-#             real_done = done[self.num_sim_envs :]
-
-#             self.real_buffer.add(real_obs, real_action, real_reward, real_next_obs, real_done)
-
-#     def _add_sim_with_tracking(self, obs, action, reward, next_obs, done):
-#         """Add sim transitions with trajectory tracking and episode detection.
-#         Called from `add` for the sim slice of each environment step."""
-#         num_envs = obs.shape[0]
-#         sim_capacity = self.sim_buffer.capacity
-
-#         # Record starting index
-#         start_idx = self.sim_buffer.idx
-
-#         # Add to buffer
-#         self.sim_buffer.add(obs, action, reward, next_obs, done)
-
-#         # Update trajectory IDs for new entries
-#         for env_idx in range(num_envs):
-#             traj_id = self._env_current_traj_id[env_idx].item()
-#             buf_idx = (start_idx + env_idx) % sim_capacity
-#             self.sim_traj_ids[buf_idx] = traj_id
-
-#             # Accumulate trajectory data for scoring
-#             self._env_traj_buffers[env_idx]["obses"].append(obs[env_idx].unsqueeze(0))
-#             self._env_traj_buffers[env_idx]["actions"].append(action[env_idx].unsqueeze(0))
-
-#         # Check for episode completions
-#         done_envs = done.squeeze(-1).nonzero(as_tuple=False).squeeze(-1)
-#         for env_idx in (
-#             done_envs.tolist() if done_envs.dim() > 0 else ([done_envs.item()] if done_envs.numel() == 1 else [])
-#         ):
-#             self._on_episode_complete(env_idx)
-
-#     def _on_episode_complete(self, env_idx: int):
-#         """Handle episode completion: queue trajectory for scoring.
-#         Triggered by `_add_sim_with_tracking` when a sim env emits done."""
-#         traj_id = self._env_current_traj_id[env_idx].item()
-#         traj_data = self._env_traj_buffers[env_idx]
-
-#         if len(traj_data["obses"]) > 0:
-#             # Stack trajectory
-#             traj_obses = torch.cat(traj_data["obses"], dim=0)  # (T, *obs_shape)
-#             traj_actions = torch.cat(traj_data["actions"], dim=0)  # (T, *action_shape)
-
-#             self._pending_trajectories.append(
-#                 {
-#                     "obses": traj_obses,
-#                     "actions": traj_actions,
-#                     "traj_id": traj_id,
-#                 }
-#             )
-
-#         # Reset trajectory buffer for this env
-#         self._env_traj_buffers[env_idx] = {"obses": [], "actions": []}
-
-#         # Assign new trajectory ID
-#         self._env_current_traj_id[env_idx] = self._next_traj_id
-#         self._next_traj_id += 1
-
-#         # Check if we should score
-#         if len(self._pending_trajectories) >= self.score_batch_size:
-#             self._score_pending_trajectories()
-
-#     def _score_pending_trajectories(self):
-#         """Score pending trajectories and update weights.
-#         Called from `_on_episode_complete` when pending count reaches threshold."""
-#         if not self._pending_trajectories or self.traj_resampler is None:
-#             # Clear pending and assign default scores
-#             for traj in self._pending_trajectories:
-#                 self.sim_traj_scores[traj["traj_id"]] = 1.0
-#             self._pending_trajectories = []
-#             return
-
-#         # Find max trajectory length for padding
-#         max_len = max(t["obses"].shape[0] for t in self._pending_trajectories)
-#         batch_size = len(self._pending_trajectories)
-
-#         # Pad and stack trajectories: (T, batch, ...)
-#         padded_obses = []
-#         padded_actions = []
-#         traj_lengths = []
-
-#         for traj in self._pending_trajectories:
-#             T = traj["obses"].shape[0]
-#             traj_lengths.append(T)
-
-#             # Pad to max_len
-#             if T < max_len:
-#                 obs_pad = torch.zeros((max_len - T, *self.obs_shape), device=self.device, dtype=traj["obses"].dtype)
-#                 act_pad = torch.zeros(
-#                     (max_len - T, *self.action_shape), device=self.device, dtype=traj["actions"].dtype
-#                 )
-#                 padded_obses.append(torch.cat([traj["obses"], obs_pad], dim=0))
-#                 padded_actions.append(torch.cat([traj["actions"], act_pad], dim=0))
-#             else:
-#                 padded_obses.append(traj["obses"])
-#                 padded_actions.append(traj["actions"])
-
-#         # Stack: (batch, T, ...) -> (T, batch, ...)
-#         obses_batch = torch.stack(padded_obses, dim=0).transpose(0, 1)  # (T, batch, *obs_shape)
-#         actions_batch = torch.stack(padded_actions, dim=0).transpose(0, 1)  # (T, batch, *action_shape)
-
-#         # Create tensor_dict for scorer
-#         tensor_dict = {
-#             "obses": obses_batch,
-#             "actions": actions_batch,
-#         }
-
-#         # Optional: train scorer
-#         if self.train_scorer:
-#             scorer_train_step = getattr(self.traj_resampler, "scorer_train_step", None)
-#             if callable(scorer_train_step):
-#                 result = scorer_train_step(tensor_dict)
-#                 if result is not None and self.writer is not None:
-#                     loss, metrics = result
-#                     for key, value in metrics.items():
-#                         self.writer.add_scalar(f"scorer/{key}", value, self._log_step)
-
-#         # Get resampling mask
-#         with torch.no_grad():
-#             mask = self.traj_resampler.resample(tensor_dict)
-
-#         # mask shape: (num_envs, T) or (T, num_envs)
-#         if mask.shape[0] == batch_size and mask.shape[1] == max_len:
-#             # (batch, T) -> keep as is
-#             pass
-#         elif mask.shape[0] == max_len and mask.shape[1] == batch_size:
-#             # (T, batch) -> transpose
-#             mask = mask.transpose(0, 1)
-
-#         # Convert mask to per-trajectory score (fraction of steps kept)
-#         for i, traj in enumerate(self._pending_trajectories):
-#             traj_id = traj["traj_id"]
-#             T = traj_lengths[i]
-
-#             # Score = fraction of valid steps kept (accounting for padding)
-#             valid_mask = mask[i, :T]
-#             score = valid_mask.float().mean().item()
-#             score = max(score, 0.01)  # Minimum score to avoid zero weights
-
-#             self.sim_traj_scores[traj_id] = score
-
-#         # Log stats
-#         if self.writer is not None:
-#             scores = [self.sim_traj_scores[t["traj_id"]] for t in self._pending_trajectories]
-#             self.writer.add_scalar("cotrain/traj_score_mean", np.mean(scores), self._log_step)
-#             self.writer.add_scalar("cotrain/traj_score_std", np.std(scores), self._log_step)
-#             self.writer.add_scalar("cotrain/traj_score_min", np.min(scores), self._log_step)
-#             self.writer.add_scalar("cotrain/traj_score_max", np.max(scores), self._log_step)
-#             self.writer.add_scalar("cotrain/num_scored_trajs", len(self._pending_trajectories), self._log_step)
-#             self._log_step += 1
-
-#         # Clear pending
-#         self._pending_trajectories = []
-
-#         # Cleanup stale trajectory scores (older than buffer capacity)
-#         self._cleanup_stale_scores()
-
-#     def _cleanup_stale_scores(self):
-#         """Remove trajectory scores for IDs no longer in the buffer.
-#         Invoked by `_score_pending_trajectories` after score updates."""
-#         if self.sim_buffer is None or not self.sim_buffer.full:
-#             return
-
-#         # Get unique trajectory IDs currently in buffer
-#         current_traj_ids = set(self.sim_traj_ids.unique().tolist())
-
-#         # Remove scores for trajectories no longer in buffer
-#         stale_ids = [tid for tid in self.sim_traj_scores.keys() if tid not in current_traj_ids]
-#         for tid in stale_ids:
-#             del self.sim_traj_scores[tid]
-
-#     def _compute_transition_weights(self) -> torch.Tensor:
-#         """Compute per-transition weights from trajectory scores.
-#         Used by `sample` when weighted sim replay sampling is enabled."""
-#         if self.sim_buffer is None:
-#             return torch.tensor([], device=self.device)
-
-#         sim_size = self.sim_buffer.capacity if self.sim_buffer.full else self.sim_buffer.idx
-#         if sim_size == 0:
-#             return torch.tensor([], device=self.device)
-
-#         weights = torch.ones(sim_size, device=self.device)
-
-#         for idx in range(sim_size):
-#             traj_id = self.sim_traj_ids[idx].item()
-#             if traj_id in self.sim_traj_scores:
-#                 weights[idx] = self.sim_traj_scores[traj_id]
-#             # else: default weight = 1.0 (unscored trajectory)
-
-#         # Normalize
-#         weights = weights / weights.sum()
-#         return weights
-
-#     def sample(self, batch_size):
-#         """
-#         Sample a combined batch with alpha-weighted real/sim sampling.
-
-#         Returns:
-#             obses, actions, rewards, next_obses, dones - same as VectorizedReplayBuffer
-#         """
-#         # Determine batch split
-#         num_real_samples = int(batch_size * self.real_data_ratio)
-#         num_sim_samples = batch_size - num_real_samples
-
-#         # Get buffer sizes
-#         sim_size = 0
-#         real_size = 0
-#         if self.sim_buffer is not None:
-#             sim_size = self.sim_buffer.capacity if self.sim_buffer.full else self.sim_buffer.idx
-#         if self.real_buffer is not None:
-#             real_size = self.real_buffer.capacity if self.real_buffer.full else self.real_buffer.idx
-
-#         # Handle edge cases
-#         if real_size == 0:
-#             num_sim_samples = batch_size
-#             num_real_samples = 0
-#         if sim_size == 0:
-#             num_real_samples = batch_size
-#             num_sim_samples = 0
-
-#         samples = []
-
-#         # Sample from SIM: weighted by trajectory scores
-#         if num_sim_samples > 0 and sim_size > 0:
-#             if self.traj_resampler is not None and self.sim_traj_scores:
-#                 # Weighted sampling
-#                 weights = self._compute_transition_weights()
-#                 sim_indices = torch.multinomial(weights, num_sim_samples, replacement=True)
-#             else:
-#                 # Uniform sampling
-#                 sim_indices = torch.randint(0, sim_size, (num_sim_samples,), device=self.device)
-
-#             sim_obses = self.sim_buffer.obses[sim_indices]
-#             sim_actions = self.sim_buffer.actions[sim_indices]
-#             sim_rewards = self.sim_buffer.rewards[sim_indices]
-#             sim_next_obses = self.sim_buffer.next_obses[sim_indices]
-#             sim_dones = self.sim_buffer.dones[sim_indices]
-
-#             samples.append((sim_obses, sim_actions, sim_rewards, sim_next_obses, sim_dones))
-
-#         # Sample from REAL: uniform
-#         if num_real_samples > 0 and real_size > 0:
-#             real_indices = torch.randint(0, real_size, (num_real_samples,), device=self.device)
-
-#             real_obses = self.real_buffer.obses[real_indices]
-#             real_actions = self.real_buffer.actions[real_indices]
-#             real_rewards = self.real_buffer.rewards[real_indices]
-#             real_next_obses = self.real_buffer.next_obses[real_indices]
-#             real_dones = self.real_buffer.dones[real_indices]
-
-#             samples.append((real_obses, real_actions, real_rewards, real_next_obses, real_dones))
-
-#         # Combine samples
-#         if len(samples) == 0:
-#             # Empty buffer case
-#             return (
-#                 torch.empty((0, *self.obs_shape), device=self.device),
-#                 torch.empty((0, *self.action_shape), device=self.device),
-#                 torch.empty((0, 1), device=self.device),
-#                 torch.empty((0, *self.obs_shape), device=self.device),
-#                 torch.empty((0, 1), dtype=torch.bool, device=self.device),
-#             )
-
-#         obses = torch.cat([s[0] for s in samples], dim=0)
-#         actions = torch.cat([s[1] for s in samples], dim=0)
-#         rewards = torch.cat([s[2] for s in samples], dim=0)
-#         next_obses = torch.cat([s[3] for s in samples], dim=0)
-#         dones = torch.cat([s[4] for s in samples], dim=0)
-
-#         # Shuffle combined batch
-#         perm = torch.randperm(obses.shape[0], device=self.device)
-#         obses = obses[perm]
-#         actions = actions[perm]
-#         rewards = rewards[perm]
-#         next_obses = next_obses[perm]
-#         dones = dones[perm]
-
-#         return obses, actions, rewards, next_obses, dones
-
-#     def get_stats(self) -> dict:
-#         """Get co-training statistics for logging."""
-#         stats = {
-#             "cotrain/real_data_ratio": self.real_data_ratio,
-#             "cotrain/num_scored_trajs": len(self.sim_traj_scores),
-#         }
-
-#         if self.sim_buffer is not None:
-#             sim_size = self.sim_buffer.capacity if self.sim_buffer.full else self.sim_buffer.idx
-#             stats["cotrain/sim_buffer_size"] = sim_size
-
-#         if self.real_buffer is not None:
-#             real_size = self.real_buffer.capacity if self.real_buffer.full else self.real_buffer.idx
-#             stats["cotrain/real_buffer_size"] = real_size
-
-#         if self.sim_traj_scores:
-#             scores = list(self.sim_traj_scores.values())
-#             stats["cotrain/score_mean"] = np.mean(scores)
-#             stats["cotrain/score_std"] = np.std(scores)
-#             stats["cotrain/score_min"] = np.min(scores)
-#             stats["cotrain/score_max"] = np.max(scores)
-
-#         return stats
+class CotrainVectorizedReplayBuffer:
+    """
+    Dual replay buffer for SAC co-training with per-episode score weighting.
+
+    Wraps two VectorizedReplayBuffer instances (sim and real).
+    Per-env episode scores are updated when done flags fire via scorer.score_episode().
+    Sim transitions are sampled proportionally to their env's current score.
+
+    Environment layout:
+        [0, num_sim_envs)               -> sim envs
+        [num_sim_envs, num_total_envs)  -> real envs
+    """
+
+    def __init__(
+        self,
+        obs_shape: tuple,
+        action_shape: tuple,
+        capacity: int,
+        device,
+        num_sim_envs: int,
+        num_total_envs: int,
+        real_data_ratio: float = 0.3,
+        traj_resampler=None,
+        score_batch_size: int = 16,  # kept for API compat, unused
+        train_scorer: bool = False,
+        writer=None,
+    ):
+        from rl_games.common.experience import VectorizedReplayBuffer
+
+        self.device = device
+        self.num_sim_envs = num_sim_envs
+        self.num_real_envs = num_total_envs - num_sim_envs
+        self.real_data_ratio = real_data_ratio
+        self.traj_resampler = traj_resampler
+        self.train_scorer = train_scorer
+        self.writer = writer
+        self._log_step = 0
+
+        # Proportional capacity split
+        ns, nr = num_sim_envs, self.num_real_envs
+        sim_cap = max(1, int(capacity * (1 - real_data_ratio))) if ns > 0 else 0
+        real_cap = (capacity - sim_cap) if nr > 0 else 0
+
+        self._sim_buf = VectorizedReplayBuffer(obs_shape, action_shape, sim_cap, device) if sim_cap > 0 else None
+        self._real_buf = VectorizedReplayBuffer(obs_shape, action_shape, real_cap, device) if real_cap > 0 else None
+
+        # Per-slot env_id for weighted sim sampling (mirrors VectorizedReplayBuffer write layout)
+        self._sim_env_ids = torch.zeros(sim_cap, dtype=torch.long, device=device) if sim_cap > 0 else None
+        # Per-env score; default 1.0 until first episode completes
+        self._sim_scores = torch.ones(ns, dtype=torch.float32, device=device) if ns > 0 else None
+
+        # Per-env episode accumulators (cleared on done)
+        self._acc_obs: list = [[] for _ in range(ns)]
+        self._acc_act: list = [[] for _ in range(ns)]
+
+        print(
+            f"[CotrainVectorizedReplayBuffer] sim_envs={ns} real_envs={nr} "
+            f"sim_cap={sim_cap} real_cap={real_cap} "
+            f"scorer={type(traj_resampler).__name__ if traj_resampler else 'None'}"
+        )
+
+    # compat properties used by SACAgent
+    @property
+    def idx(self):
+        if self._sim_buf is not None:
+            return self._sim_buf.idx
+        return self._real_buf.idx if self._real_buf is not None else 0
+
+    @property
+    def full(self):
+        if self._sim_buf is not None:
+            return self._sim_buf.full
+        return self._real_buf.full if self._real_buf is not None else False
+
+    def add(self, obs, action, reward, next_obs, done):
+        """
+        Add one step from all envs.
+
+        Args:
+            obs:      (num_total_envs, *obs_shape)
+            action:   (num_total_envs, *action_shape)
+            reward:   (num_total_envs, 1)
+            next_obs: (num_total_envs, *obs_shape)
+            done:     (num_total_envs, 1)
+        """
+        ns = self.num_sim_envs
+        if ns > 0 and self._sim_buf is not None:
+            self._add_sim(obs[:ns], action[:ns], reward[:ns], next_obs[:ns], done[:ns])
+        if self.num_real_envs > 0 and self._real_buf is not None:
+            self._real_buf.add(obs[ns:], action[ns:], reward[ns:], next_obs[ns:], done[ns:])
+
+    def _add_sim(self, obs, action, reward, next_obs, done):
+        ns = obs.shape[0]
+        cap = self._sim_buf.capacity
+        old_idx = self._sim_buf.idx
+        remaining = min(cap - old_idx, ns)
+        overflow = ns - remaining
+
+        # Mirror VectorizedReplayBuffer's write layout to track env_id per slot
+        if remaining > 0:
+            self._sim_env_ids[old_idx : old_idx + remaining] = torch.arange(remaining, device=self.device)
+        if overflow > 0:
+            self._sim_env_ids[0:overflow] = torch.arange(remaining, ns, device=self.device)
+
+        self._sim_buf.add(obs, action, reward, next_obs, done)
+
+        # Accumulate per-env and score on episode end
+        done_flat = done.squeeze(-1)
+        for i in range(ns):
+            self._acc_obs[i].append(obs[i])
+            self._acc_act[i].append(action[i])
+            if done_flat[i].item():
+                self._score_episode(i)
+
+    def _score_episode(self, env_i: int):
+        """Score completed episode, update sim_scores[env_i], reset accumulators."""
+        acc_obs = self._acc_obs[env_i]
+        acc_act = self._acc_act[env_i]
+        self._acc_obs[env_i] = []
+        self._acc_act[env_i] = []
+
+        if self.traj_resampler is None or len(acc_obs) == 0:
+            return
+
+        states = torch.stack(acc_obs)   # (T, obs_dim)
+        actions = torch.stack(acc_act)  # (T, action_dim)
+        with torch.no_grad():
+            score = float(self.traj_resampler.score_episode(states, actions))
+
+        self._sim_scores[env_i] = score
+        if self.writer is not None:
+            self.writer.add_scalar("cotrain/sim_score", score, self._log_step)
+            self._log_step += 1
+
+        if self.train_scorer:
+            self.traj_resampler.scorer_train_step({"obses": states.unsqueeze(1), "actions": actions.unsqueeze(1)})
+
+    def sample(self, batch_size: int):
+        """
+        Sample a combined batch: score-weighted sim + uniform real.
+
+        Returns:
+            obses, actions, rewards, next_obses, dones
+        """
+        sim_size = (self._sim_buf.capacity if self._sim_buf.full else self._sim_buf.idx) if self._sim_buf else 0
+        real_size = (self._real_buf.capacity if self._real_buf.full else self._real_buf.idx) if self._real_buf else 0
+
+        nr = int(batch_size * self.real_data_ratio) if real_size > 0 else 0
+        ns_batch = (batch_size - nr) if sim_size > 0 else 0
+        nr = batch_size - ns_batch  # recalculate in case sim is empty
+
+        parts = []
+        if ns_batch > 0:
+            weights = self._sim_scores[self._sim_env_ids[:sim_size]].clamp(min=1e-6)
+            sim_idx = torch.multinomial(weights, ns_batch, replacement=True)
+            parts.append((
+                self._sim_buf.obses[sim_idx],
+                self._sim_buf.actions[sim_idx],
+                self._sim_buf.rewards[sim_idx],
+                self._sim_buf.next_obses[sim_idx],
+                self._sim_buf.dones[sim_idx],
+            ))
+
+        if nr > 0:
+            real_idx = torch.randint(0, real_size, (nr,), device=self.device)
+            parts.append((
+                self._real_buf.obses[real_idx],
+                self._real_buf.actions[real_idx],
+                self._real_buf.rewards[real_idx],
+                self._real_buf.next_obses[real_idx],
+                self._real_buf.dones[real_idx],
+            ))
+
+        obses      = torch.cat([p[0] for p in parts])
+        actions    = torch.cat([p[1] for p in parts])
+        rewards    = torch.cat([p[2] for p in parts])
+        next_obses = torch.cat([p[3] for p in parts])
+        dones      = torch.cat([p[4] for p in parts])
+
+        perm = torch.randperm(obses.shape[0], device=self.device)
+        return obses[perm], actions[perm], rewards[perm], next_obses[perm], dones[perm]

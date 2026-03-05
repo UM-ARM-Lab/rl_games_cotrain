@@ -828,7 +828,12 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data("states", n, self.obs["states"])
 
             step_time_start = time.time()
-            self.obs, rewards, self.dones, infos = self.env_step(res_dict["actions"])
+            # Val envs use mean actions for deterministic rollout (comparable to dedicated eval)
+            step_actions = res_dict["actions"]
+            if self.num_val > 0:
+                step_actions = step_actions.clone()
+                step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
+            self.obs, rewards, self.dones, infos = self.env_step(step_actions)
             step_time_end = time.time()
 
             step_time += step_time_end - step_time_start
@@ -920,7 +925,12 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data("states", n, self.obs["states"])
 
             step_time_start = time.time()
-            self.obs, rewards, self.dones, infos = self.env_step(res_dict["actions"])
+            # Val envs use mean actions for deterministic rollout (comparable to dedicated eval)
+            step_actions = res_dict["actions"]
+            if self.num_val > 0:
+                step_actions = step_actions.clone()
+                step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
+            self.obs, rewards, self.dones, infos = self.env_step(step_actions)
             step_time_end = time.time()
 
             step_time += step_time_end - step_time_start

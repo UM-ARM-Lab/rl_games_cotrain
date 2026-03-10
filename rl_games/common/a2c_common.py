@@ -33,6 +33,53 @@ def swap_and_flatten01(arr):
     return arr.transpose(0, 1).reshape(s[0] * s[1], *s[2:])
 
 
+def _slice_batch_dict_to_train(batch_dict: dict, batch_size: int) -> dict:
+    """
+    Slice batch_dict tensor fields to only include train env rows.
+
+    After swap_and_flatten01(tensor[T, N]), the layout is [train_env_rows | val_env_rows]
+    with the boundary at batch_size = horizon_length * num_train_envs. Val env rows must
+    be removed before prepare_dataset so that advantage and value normalization statistics
+    are computed only from train env data.
+
+    Non-tensor values (rnn_states list, scalars like played_frames) are passed through
+    unchanged.
+
+    Args:
+        batch_dict: Dict of tensors shaped (N_total * T, ...) plus non-tensor fields.
+        batch_size: Number of rows belonging to train envs = horizon_length * num_train_envs.
+
+    Returns:
+        New dict with tensor values sliced to [:batch_size], non-tensors unchanged.
+    """
+    return {
+        k: v[:batch_size] if isinstance(v, torch.Tensor) and v.shape[0] > batch_size else v
+        for k, v in batch_dict.items()
+    }
+
+
+def _filter_train_done_indices(
+    env_done_indices: torch.Tensor, num_train: int
+) -> torch.Tensor:
+    """
+    Filter done-episode environment indices to exclude val envs.
+
+    Train envs occupy indices [0, num_train). Val envs occupy [num_train, num_actors).
+    When a val env episode completes, its index must NOT be added to game_rewards so
+    that logged mean_rewards and checkpoint-save decisions reflect only train env performance.
+
+    Args:
+        env_done_indices: 1-D tensor of environment indices with completed episodes.
+        num_train: Number of train environments (num_train_envs).
+
+    Returns:
+        Filtered tensor containing only indices < num_train.
+    """
+    if env_done_indices.numel() == 0:
+        return env_done_indices
+    return env_done_indices[env_done_indices < num_train]
+
+
 def rescale_actions(low, high, action):
     d = (high - low) / 2.0
     m = (high + low) / 2.0

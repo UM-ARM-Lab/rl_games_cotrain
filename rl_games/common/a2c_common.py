@@ -69,15 +69,21 @@ def _filter_train_done_indices(
     that logged mean_rewards and checkpoint-save decisions reflect only train env performance.
 
     Args:
-        env_done_indices: 1-D tensor of environment indices with completed episodes.
+        env_done_indices: Tensor of environment indices with completed episodes.
+            In play_steps, this is 2-D (M, 1) from dones.nonzero(as_tuple=False).
         num_train: Number of train environments (num_train_envs).
 
     Returns:
-        Filtered tensor containing only indices < num_train.
+        Filtered tensor with only indices < num_train, preserving input shape.
     """
     if env_done_indices.numel() == 0:
         return env_done_indices
-    return env_done_indices[env_done_indices < num_train]
+    # Use a 1-D row mask to preserve the (M, 1) shape from dones.nonzero().
+    # Plain boolean indexing (env_done_indices[env_done_indices < num_train]) would
+    # flatten a 2-D input to 1-D, changing the shape seen by AverageMeter.update()
+    # and causing get_mean() to return a 0-d scalar instead of a (value_size,) array.
+    row_mask = (env_done_indices < num_train).reshape(-1)
+    return env_done_indices[row_mask]
 
 
 def rescale_actions(low, high, action):

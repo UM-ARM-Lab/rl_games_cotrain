@@ -1065,6 +1065,11 @@ class A2CBase(BaseAlgorithm):
         batch_dict["played_frames"] = self.batch_size
         batch_dict["step_time"] = step_time
 
+        # Slice out val env rows so prepare_dataset normalizes only over train envs.
+        # rnn_states is a Python list, preserved by isinstance(v, torch.Tensor) guard.
+        if self.env_has_train_val:
+            batch_dict = _slice_batch_dict_to_train(batch_dict, self.batch_size)
+
         return batch_dict
 
 

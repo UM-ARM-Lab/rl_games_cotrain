@@ -939,6 +939,11 @@ class A2CBase(BaseAlgorithm):
         batch_dict["played_frames"] = self.batch_size
         batch_dict["step_time"] = step_time
 
+        # Slice out val env rows so prepare_dataset normalizes only over train envs.
+        # After swap_and_flatten01, layout is [train_rows | val_rows] with boundary at batch_size.
+        if self.env_has_train_val:
+            batch_dict = _slice_batch_dict_to_train(batch_dict, self.batch_size)
+
         return batch_dict
 
     def play_steps_rnn(self):

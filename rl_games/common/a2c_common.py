@@ -1018,9 +1018,16 @@ class A2CBase(BaseAlgorithm):
                 if self.has_central_value:
                     self.central_value_net.post_step_rnn(all_done_indices)
 
-            self.game_rewards.update(self.current_rewards[env_done_indices])
-            self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
-            self.game_lengths.update(self.current_lengths[env_done_indices])
+            # For train/val setups, exclude val env done episodes from reward tracking.
+            train_done_indices = (
+                _filter_train_done_indices(env_done_indices, self.num_train)
+                if self.env_has_train_val
+                else env_done_indices
+            )
+
+            self.game_rewards.update(self.current_rewards[train_done_indices])
+            self.game_shaped_rewards.update(self.current_shaped_rewards[train_done_indices])
+            self.game_lengths.update(self.current_lengths[train_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
 
             not_dones = 1.0 - self.dones.float()

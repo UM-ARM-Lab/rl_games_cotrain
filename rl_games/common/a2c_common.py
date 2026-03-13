@@ -796,7 +796,12 @@ class A2CBase(BaseAlgorithm):
             self.scaler.load_state_dict(weights["scaler"])
 
     def set_weights(self, weights):
-        self.model.load_state_dict(weights["model"])
+        model_state = weights["model"]
+        # Strip torch.compile prefix (_orig_mod.) if present so checkpoints saved
+        # with torch.compile load correctly into uncompiled models.
+        if any(k.startswith("_orig_mod.") for k in model_state):
+            model_state = {k.removeprefix("_orig_mod."): v for k, v in model_state.items()}
+        self.model.load_state_dict(model_state)
         self.set_stats_weights(weights)
 
     def get_param(self, param_name):

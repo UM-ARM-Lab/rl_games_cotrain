@@ -396,11 +396,9 @@ class A2CBase(BaseAlgorithm):
             self.num_train = self.num_actors
             self.num_val = 0
 
-        # Cotrain configuration
-        # Track cotrain configuration
-        self.cotrain_cfg = self.config["cotrain"]
+        # Cotrain configuration (optional — defaults to disabled when not present)
+        self.cotrain_cfg = self.config.get("cotrain", {"enabled": False, "num_train_real": 0, "num_train_sim": self.num_actors, "scorer": None})
         self.cotrain_enabled = self.cotrain_cfg["enabled"]
-        # Check for cotrain configuration
         self.num_train_real = self.cotrain_cfg["num_train_real"]
         self.num_train_sim = self.cotrain_cfg["num_train_sim"]
         self.scorer_cfg = self.cotrain_cfg["scorer"]

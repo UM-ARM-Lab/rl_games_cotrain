@@ -387,7 +387,7 @@ class A2CBase(BaseAlgorithm):
 
         # Train Val Split
         # Track sim/real split for collapse diagnostics (independent of cotrain)
-        self.env_has_train_val = self.config["train_val"]
+        self.env_has_train_val = self.config.get("train_val", False)
         if self.env_has_train_val:
             self.num_train = self.config["num_train_envs"]
             self.num_val = self.config["num_val_envs"]

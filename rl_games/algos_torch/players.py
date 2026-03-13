@@ -14,6 +14,13 @@ def _resolve_checkpoint(checkpoint_or_path):
     return torch_ext.load_checkpoint(checkpoint_or_path)
 
 
+def _strip_orig_mod(state_dict):
+    """Strip torch.compile prefix (_orig_mod.) so compiled checkpoints load into uncompiled models."""
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        return {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    return state_dict
+
+
 def rescale_actions(low, high, action):
     d = (high - low) / 2.0
     m = (high + low) / 2.0
@@ -77,7 +84,7 @@ class PpoPlayerContinuous(BasePlayer):
 
     def restore(self, checkpoint_or_path):
         checkpoint = _resolve_checkpoint(checkpoint_or_path)
-        self.model.load_state_dict(checkpoint['model'])
+        self.model.load_state_dict(_strip_orig_mod(checkpoint['model']))
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 
@@ -181,7 +188,7 @@ class PpoPlayerDiscrete(BasePlayer):
 
     def restore(self, checkpoint_or_path):
         checkpoint = _resolve_checkpoint(checkpoint_or_path)
-        self.model.load_state_dict(checkpoint['model'])
+        self.model.load_state_dict(_strip_orig_mod(checkpoint['model']))
         if self.normalize_input and 'running_mean_std' in checkpoint:
             self.model.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
 

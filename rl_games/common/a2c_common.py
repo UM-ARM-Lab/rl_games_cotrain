@@ -611,6 +611,9 @@ class A2CBase(BaseAlgorithm):
             ]
             if self.num_val > 0:
                 self.frozen_model = copy.deepcopy(self.model)
+                for m in self.frozen_model.modules():
+                    if hasattr(m, 'flatten_parameters'):
+                        m.flatten_parameters()
 
     def init_rnn_from_model(self, model):
         self.is_rnn = self.model.is_rnn()
@@ -1043,6 +1046,9 @@ class A2CBase(BaseAlgorithm):
                         s[:, all_done_indices, :] = s[:, all_done_indices, :] * 0.0
                 if self.num_val > 0 and (all_done_indices >= self.num_train * self.num_agents).any():
                     self.frozen_model.load_state_dict(self.model.state_dict())
+                    for m in self.frozen_model.modules():
+                        if hasattr(m, 'flatten_parameters'):
+                            m.flatten_parameters()
                 if self.has_central_value:
                     self.central_value_net.post_step_rnn(all_done_indices)
 

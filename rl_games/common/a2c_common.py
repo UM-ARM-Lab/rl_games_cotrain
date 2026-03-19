@@ -521,8 +521,8 @@ class A2CBase(BaseAlgorithm):
 
     def _get_action_values_split(self, obs, n_train):
         processed_obs = self._preproc_obs(obs["obs"])
-        train_rnn = [s[:, :n_train] for s in self.rnn_states]
-        val_rnn   = [s[:, n_train:] for s in self.rnn_states]
+        train_rnn = [s[:, :n_train].contiguous() for s in self.rnn_states]
+        val_rnn   = [s[:, n_train:].contiguous() for s in self.rnn_states]
         self.model.eval()
         self.frozen_model.eval()
         with torch.no_grad():

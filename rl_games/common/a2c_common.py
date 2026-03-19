@@ -519,6 +519,19 @@ class A2CBase(BaseAlgorithm):
                 res_dict["values"] = value
         return res_dict
 
+    def _get_action_values_split(self, obs, n_train):
+        processed_obs = self._preproc_obs(obs["obs"])
+        train_rnn = [s[:, :n_train] for s in self.rnn_states]
+        val_rnn   = [s[:, n_train:] for s in self.rnn_states]
+        self.model.eval()
+        self.frozen_model.eval()
+        with torch.no_grad():
+            rt = self.model(       {"is_train": False, "prev_actions": None, "obs": processed_obs[:n_train], "rnn_states": train_rnn})
+            rv = self.frozen_model({"is_train": False, "prev_actions": None, "obs": processed_obs[n_train:], "rnn_states": val_rnn})
+        merged = {k: torch.cat([rt[k], rv[k]], dim=0) for k in rt if isinstance(rt[k], torch.Tensor)}
+        merged["rnn_states"] = [torch.cat([a, b], dim=1) for a, b in zip(rt["rnn_states"], rv["rnn_states"])]
+        return merged
+
     def get_values(self, obs):
         with torch.no_grad():
             if self.has_central_value:
@@ -596,6 +609,8 @@ class A2CBase(BaseAlgorithm):
                 )
                 for s in self.rnn_states
             ]
+            if self.num_val > 0:
+                self.frozen_model = copy.deepcopy(self.model)
 
     def init_rnn_from_model(self, model):
         self.is_rnn = self.model.is_rnn()
@@ -982,6 +997,8 @@ class A2CBase(BaseAlgorithm):
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
+            elif self.num_val > 0:
+                res_dict = self._get_action_values_split(self.obs, self.num_train * self.num_agents)
             else:
                 res_dict = self.get_action_values(self.obs)
 
@@ -1024,6 +1041,8 @@ class A2CBase(BaseAlgorithm):
                 if self.zero_rnn_on_done:
                     for s in self.rnn_states:
                         s[:, all_done_indices, :] = s[:, all_done_indices, :] * 0.0
+                if self.num_val > 0 and (all_done_indices >= self.num_train * self.num_agents).any():
+                    self.frozen_model.load_state_dict(self.model.state_dict())
                 if self.has_central_value:
                     self.central_value_net.post_step_rnn(all_done_indices)
 

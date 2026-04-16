@@ -396,12 +396,11 @@ class A2CBase(BaseAlgorithm):
             self.num_train = self.num_actors
             self.num_val = 0
 
-        # Cotrain configuration (optional — defaults to disabled when not present)
-        self.cotrain_cfg = self.config.get("cotrain", {"enabled": False, "num_train_real": 0, "num_train_sim": self.num_actors, "scorer": None})
+        # Cotrain configuration (optional -- defaults to disabled when not present)
+        self.cotrain_cfg = self.config.get("cotrain", {"enabled": False, "num_train_real": 0, "num_train_sim": self.num_actors})
         self.cotrain_enabled = self.cotrain_cfg["enabled"]
         self.num_train_real = self.cotrain_cfg["num_train_real"]
         self.num_train_sim = self.cotrain_cfg["num_train_sim"]
-        self.scorer_cfg = self.cotrain_cfg["scorer"]
 
     def trancate_gradients_and_step(self):
         if self.multi_gpu:
@@ -566,13 +565,16 @@ class A2CBase(BaseAlgorithm):
                 raise NotImplementedError("Train/Val split is not supported without cotraining")
             self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
         else:
+            scorer = self.cotrain_cfg.get("scorer_object", None)
+            scorer_threshold = self.cotrain_cfg.get("scorer_threshold", None)
             self.experience_buffer = CotrainExperienceBuffer(
                 self.env_info,
                 algo_info,
                 self.ppo_device,
-                num_real_envs=self.num_train_real,
                 num_sim_envs=self.num_train_sim,
-                scorer_cfg=self.scorer_cfg,
+                num_real_envs=self.num_train_real,
+                scorer=scorer,
+                threshold=scorer_threshold,
                 writer=self.writer,
             )
 
@@ -890,6 +892,12 @@ class A2CBase(BaseAlgorithm):
                 step_actions = step_actions.clone()
                 step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
             self.obs, rewards, self.dones, infos = self.env_step(step_actions)
+
+            # Store collect_obs for dynamics scoring (low_dim_state from env)
+            if self.cotrain_enabled and hasattr(self.vec_env.env, 'unwrapped'):
+                collect_obs = self.vec_env.env.unwrapped.collect_obs.clone()
+                self.experience_buffer.update_data("collect_obses", n, collect_obs)
+
             step_time_end = time.time()
 
             step_time += step_time_end - step_time_start
@@ -1001,6 +1009,12 @@ class A2CBase(BaseAlgorithm):
                 step_actions = step_actions.clone()
                 step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
             self.obs, rewards, self.dones, infos = self.env_step(step_actions)
+
+            # Store collect_obs for dynamics scoring (low_dim_state from env)
+            if self.cotrain_enabled and hasattr(self.vec_env.env, 'unwrapped'):
+                collect_obs = self.vec_env.env.unwrapped.collect_obs.clone()
+                self.experience_buffer.update_data("collect_obses", n, collect_obs)
+
             step_time_end = time.time()
 
             step_time += step_time_end - step_time_start

@@ -13,6 +13,7 @@ from tqdm import tqdm, trange
 from rl_games.algos_torch import model_builder, torch_ext
 from rl_games.common import experience, schedulers, vecenv
 from rl_games.common.a2c_common import print_statistics
+from rl_games.common.cotrain_experience import CotrainVectorizedReplayBuffer
 from rl_games.interfaces.base_algorithm import BaseAlgorithm
 
 
@@ -83,32 +84,60 @@ class SACAgent(BaseAlgorithm):
             [self.log_alpha], lr=float(self.config["alpha_lr"]), betas=self.config.get("alphas_betas", [0.9, 0.999])
         )
 
-        # Co-training configuration
-        cotrain_cfg = self.config.get("cotrain", {})
-        self.cotrain_enabled = cotrain_cfg.get("enabled", False)
-        if self.cotrain_enabled:
-            num_real_envs = cotrain_cfg.get("num_real_envs", 0)
-            num_sim_envs = self.num_actors - num_real_envs
-            self.replay_buffer = experience.CotrainVectorizedReplayBuffer(
-                obs_shape=self.env_info["observation_space"].shape,
-                action_shape=self.env_info["action_space"].shape,
-                capacity=self.replay_buffer_size,
-                device=self._device,
-                num_sim_envs=num_sim_envs,
-                num_total_envs=self.num_actors,
-                real_data_ratio=cotrain_cfg.get("real_data_ratio", 0.3),
-                traj_resampler=cotrain_cfg.get("traj_resampler", None),
-                score_batch_size=cotrain_cfg.get("score_batch_size", 32),
-                train_scorer=cotrain_cfg.get("train_scorer", False),
-                writer=self.writer,
+        # Train/Val split: when enabled, obs rows [num_train_envs:] are validation
+        # envs whose transitions must NOT enter the replay buffer.
+        self.train_val_enabled = config.get("train_val", False)
+        if self.train_val_enabled:
+            self.num_train_envs = config["num_train_envs"]
+            self.num_val_envs = config["num_val_envs"]
+            assert self.num_train_envs + self.num_val_envs == self.num_actors, (
+                f"num_train_envs ({self.num_train_envs}) + num_val_envs ({self.num_val_envs}) "
+                f"must equal num_actors ({self.num_actors})"
             )
         else:
+            self.num_train_envs = self.num_actors
+            self.num_val_envs = 0
+
+        # Co-training configuration
+        cotrain_cfg = self.config.get("cotrain", {"enabled": False})
+        self.cotrain_enabled = cotrain_cfg.get("enabled", False)
+
+        if not self.cotrain_enabled:
+            if self.train_val_enabled:
+                raise NotImplementedError(
+                    "Train/Val split is not supported without cotraining (SAC)"
+                )
             self.replay_buffer = experience.VectorizedReplayBuffer(
                 self.env_info["observation_space"].shape,
                 self.env_info["action_space"].shape,
                 self.replay_buffer_size,
                 self._device,
             )
+        else:
+            num_train_real = cotrain_cfg["num_train_real"]
+            num_train_sim = cotrain_cfg["num_train_sim"]
+            assert num_train_real + num_train_sim == self.num_train_envs, (
+                f"cotrain.num_train_real ({num_train_real}) + cotrain.num_train_sim "
+                f"({num_train_sim}) must equal num_train_envs ({self.num_train_envs})"
+            )
+            self.replay_buffer = CotrainVectorizedReplayBuffer(
+                obs_shape=self.env_info["observation_space"].shape,
+                action_shape=self.env_info["action_space"].shape,
+                capacity=self.replay_buffer_size,
+                device=self._device,
+                num_train_real=num_train_real,
+                num_train_sim=num_train_sim,
+                num_total_envs=self.num_actors,
+                real_data_ratio=cotrain_cfg.get("real_data_ratio", 0.3),
+                traj_resampler=cotrain_cfg.get("scorer_object", None),
+                train_scorer=cotrain_cfg.get("train_scorer", False),
+                writer=self.writer,
+            )
+
+        # Recompute frames-per-epoch to count only training envs -- val frames
+        # don't contribute to training, so FPS/frame accounting should ignore them.
+        self.num_frames_per_epoch = self.num_train_envs * self.num_steps_per_episode
+
         self.target_entropy_coef = config.get("target_entropy_coef", 1.0)
         self.target_entropy = self.target_entropy_coef * -self.env_info["action_space"].shape[0]
         print("Target entropy", self.target_entropy)
@@ -493,7 +522,20 @@ class SACAgent(BaseAlgorithm):
                 )
             else:
                 with torch.no_grad():
-                    action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
+                    if self.num_val_envs == 0:
+                        action = self.act(obs.float(), self.env_info["action_space"].shape, sample=True)
+                    else:
+                        # Train envs sample stochastically; val envs use deterministic
+                        # mean so their rollouts serve as honest validation.
+                        train_action = self.act(
+                            obs[: self.num_train_envs].float(),
+                            self.env_info["action_space"].shape, sample=True,
+                        )
+                        val_action = self.act(
+                            obs[self.num_train_envs:].float(),
+                            self.env_info["action_space"].shape, sample=False,
+                        )
+                        action = torch.cat([train_action, val_action], dim=0)
 
             step_start = time.time()
 
@@ -509,11 +551,19 @@ class SACAgent(BaseAlgorithm):
 
             all_done_indices = dones.nonzero(as_tuple=False)
             done_indices = all_done_indices[:: self.num_agents]
-            self.game_rewards.update(self.current_rewards[done_indices])
-            self.game_lengths.update(self.current_lengths[done_indices])
+            # Track episode rewards only for training envs so checkpoint-save and logged
+            # mean_rewards reflect training performance (val envs are scored separately).
+            if self.train_val_enabled and done_indices.numel() > 0:
+                row_mask = (done_indices < self.num_train_envs).reshape(-1)
+                train_done_indices = done_indices[row_mask]
+            else:
+                train_done_indices = done_indices
+            self.game_rewards.update(self.current_rewards[train_done_indices])
+            self.game_lengths.update(self.current_lengths[train_done_indices])
 
             not_dones = 1.0 - dones.float()
 
+            # process_infos still sees all envs so val success metrics reach the observer.
             self.algo_observer.process_infos(infos, done_indices)
 
             no_timeouts = self.current_lengths != self.max_env_steps

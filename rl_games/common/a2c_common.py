@@ -565,18 +565,22 @@ class A2CBase(BaseAlgorithm):
                 raise NotImplementedError("Train/Val split is not supported without cotraining")
             self.experience_buffer = ExperienceBuffer(self.env_info, algo_info, self.ppo_device)
         else:
-            scorer = self.cotrain_cfg.get("scorer_object", None)
-            scorer_threshold = self.cotrain_cfg.get("scorer_threshold", None)
             self.experience_buffer = CotrainExperienceBuffer(
                 self.env_info,
                 algo_info,
                 self.ppo_device,
-                num_sim_envs=self.num_train_sim,
-                num_real_envs=self.num_train_real,
-                scorer=scorer,
-                threshold=scorer_threshold,
                 writer=self.writer,
             )
+            # Late-bind scorer/threshold and sim-env indices via setters.
+            # The training experiment injects these into cotrain_cfg once the env
+            # and scorer are constructed (see exp_cotrain_ppo.CotrainPPOExperiment).
+            scorer = self.cotrain_cfg.get("scorer_object", None)
+            scorer_threshold = self.cotrain_cfg.get("scorer_threshold", None)
+            sim_env_idx = self.cotrain_cfg.get("sim_env_idx", None)
+            if scorer is not None and scorer_threshold is not None:
+                self.experience_buffer.set_scorer(scorer, scorer_threshold)
+            if sim_env_idx is not None:
+                self.experience_buffer.set_sim_env_idx(sim_env_idx)
 
         val_shape = (self.horizon_length, batch_size, self.value_size)
         current_rewards_shape = (batch_size, self.value_size)

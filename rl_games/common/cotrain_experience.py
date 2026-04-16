@@ -5,7 +5,9 @@ Wraps ExperienceBuffer for sim-real co-training. At rollout boundaries,
 scores sim-env trajectory segments via a BaseScorer and resamples the
 buffer to exclude low-quality segments.
 
-Env layout: [sim_envs | real_envs]
+Scorer, threshold, and the concrete sim-env indices are injected via
+setters after construction (the indices come from the env, which is not
+necessarily available at buffer-construction time).
 """
 
 from typing import Callable, Dict, List, Optional
@@ -16,14 +18,14 @@ from rl_games.common.experience import ExperienceBuffer
 class CotrainExperienceBuffer:
     """PPO experience buffer for sim-real co-training with dynamics scoring.
 
-    Wraps a single ExperienceBuffer covering all envs (sim first, then real).
-    At rollout boundaries, extracts trajectory segments from sim envs, scores
-    them with the provided scorer, builds a per-timestep acceptance mask, and
-    resamples accepted timesteps to fill the original batch size.
+    Wraps a single ExperienceBuffer covering all envs. At rollout boundaries,
+    extracts trajectory segments from the sim envs identified by
+    `sim_env_idx`, scores them with the provided scorer, builds a
+    per-timestep acceptance mask, and resamples accepted timesteps to fill
+    the original batch size.
 
-    The scorer is optional. When None (or threshold is None), the buffer
-    behaves identically to a standard ExperienceBuffer -- no scoring or
-    resampling is performed.
+    Scorer, threshold, and `sim_env_idx` are set via setters; resampling is
+    only performed when all three are present.
     """
 
     def __init__(
@@ -31,10 +33,6 @@ class CotrainExperienceBuffer:
         env_info: dict,
         algo_info: dict,
         device: str,
-        num_sim_envs: int,
-        num_real_envs: int,
-        scorer=None,
-        threshold: Optional[float] = None,
         writer=None,
     ):
         """
@@ -42,33 +40,50 @@ class CotrainExperienceBuffer:
             env_info: RL Games env info dict.
             algo_info: RL Games algo info dict (num_actors, horizon_length, etc.).
             device: Torch device string.
-            num_sim_envs: Number of sim envs (first columns in buffer).
-            num_real_envs: Number of real envs (last columns in buffer).
-            scorer: A BaseScorer instance (e.g. DynamicsScorer) or None.
-                    Must support scorer.score(data, "mse") -> (B,) tensor.
-                    Scorer is inference-only -- not trained online during RL.
-                    # TODO: may train scorer online in the future.
-            threshold: MSE threshold for binary accept/reject. Segments with
-                       score > threshold are rejected. None disables scoring.
             writer: Optional tensorboard SummaryWriter for logging.
         """
         self.buffer = ExperienceBuffer(env_info, algo_info, device)
         self.device = device
-        self.num_sim_envs = num_sim_envs
-        self.num_real_envs = num_real_envs
-        self.scorer = scorer
-        self.threshold = threshold
         self.writer = writer
         self._log_step = 0
 
-        # Cache scorer params if available
-        if self.scorer is not None:
-            self._horizon = self.scorer.algo.horizon
-            self._future_horizon = self.scorer.algo.future_horizon
+        self.scorer = None
+        self.threshold: Optional[float] = None
+        self._horizon: Optional[int] = None
+        self._future_horizon: Optional[int] = None
+        self.sim_env_idx: Optional[torch.Tensor] = None
+
+    def set_scorer(self, scorer, threshold: float) -> None:
+        """Inject the scorer and its accept/reject threshold.
+
+        The scorer must expose `.algo.horizon` and `.algo.future_horizon`
+        (e.g. a DynamicsScorer) and support `score(data, "mse") -> (B,)`.
+        """
+        assert scorer is not None, "scorer must be non-None"
+        assert threshold is not None, "threshold must be non-None"
+        self.scorer = scorer
+        self.threshold = float(threshold)
+        self._horizon = scorer.algo.horizon
+        self._future_horizon = scorer.algo.future_horizon
+
+    def set_sim_env_idx(self, sim_env_idx: torch.Tensor) -> None:
+        """Inject the concrete tensor of sim-env indices into the full buffer layout.
+
+        `sim_env_idx` should be a 1-D LongTensor whose entries are env
+        indices into the (T, num_envs, *) buffer. Only these envs get
+        dynamics-scored; all others are always accepted.
+        """
+        assert sim_env_idx is not None, "sim_env_idx must be non-None"
+        assert sim_env_idx.dim() == 1, f"sim_env_idx must be 1-D, got shape {tuple(sim_env_idx.shape)}"
+        self.sim_env_idx = sim_env_idx.to(self.device).long()
 
     @property
     def scoring_enabled(self) -> bool:
-        return self.scorer is not None and self.threshold is not None
+        return (
+            self.scorer is not None
+            and self.threshold is not None
+            and self.sim_env_idx is not None
+        )
 
     # ------------------------------------------------------------------
     # Data update pass-throughs
@@ -114,9 +129,9 @@ class CotrainExperienceBuffer:
         # Build per-timestep mask (T, num_envs): 1 = accept, 0 = reject
         mask = self._build_scoring_mask(td, T, num_envs)
 
-        # Log scoring stats
+        # Log scoring stats — accept rate is computed only over sim envs
         if self.writer is not None:
-            accept_rate = mask[:, :self.num_sim_envs].float().mean().item()
+            accept_rate = mask.index_select(1, self.sim_env_idx).float().mean().item()
             self.writer.add_scalar("cotrain/sim_accept_rate", accept_rate, self._log_step)
             self._log_step += 1
 
@@ -126,16 +141,18 @@ class CotrainExperienceBuffer:
         return rnn_states_raw
 
     def _build_scoring_mask(self, td: dict, T: int, num_envs: int) -> torch.Tensor:
-        """Build (T, num_envs) binary mask. Sim envs scored, real envs always 1."""
+        """Build (T, num_envs) binary mask. Sim envs (identified by sim_env_idx)
+        are scored; all other envs are always accepted (mask=1)."""
         mask = torch.ones(T, num_envs, device=self.device)
 
-        if self.num_sim_envs == 0:
+        num_sim = int(self.sim_env_idx.numel())
+        if num_sim == 0:
             return mask
 
-        # Extract sim-env data for scoring
+        # Gather sim-env data for scoring using the concrete env indices.
         # collect_obses: (T, num_envs, state_dim) -- stored during play_steps
-        collect_obses = td["collect_obses"][:, :self.num_sim_envs]  # (T, num_sim, D_s)
-        actions = td["actions"][:, :self.num_sim_envs]              # (T, num_sim, D_a)
+        collect_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, num_sim, D_s)
+        actions = td["actions"].index_select(1, self.sim_env_idx)              # (T, num_sim, D_a)
 
         H = self._horizon
         F = self._future_horizon
@@ -146,7 +163,6 @@ class CotrainExperienceBuffer:
             # Trajectory too short for any valid segment -- accept all
             return mask
 
-        num_sim = self.num_sim_envs
         num_chunks = len(chunk_starts)
 
         # Build batched scorer input: (num_chunks * num_sim, H, D_s) etc.
@@ -177,7 +193,7 @@ class CotrainExperienceBuffer:
             # The scored region is [t+H, t+H+F) -- the future window
             sim_mask[t + H:t + H + F] = chunk_accept[i].unsqueeze(0).expand(F, -1)
 
-        mask[:, :self.num_sim_envs] = sim_mask
+        mask[:, self.sim_env_idx] = sim_mask
         return mask
 
     def _resample_buffer(self, td: dict, mask: torch.Tensor, T: int, num_envs: int):

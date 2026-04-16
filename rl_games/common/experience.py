@@ -206,19 +206,26 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 
 
 class VectorizedReplayBuffer:
-    def __init__(self, obs_shape, action_shape, capacity, device):
+    def __init__(self, obs_shape, action_shape, capacity, device, num_train=None):
         """Create Vectorized Replay buffer.
+
         Parameters
         ----------
-        size: int
-            Max number of transitions to store in the buffer. When the buffer
-            overflows the old memories are dropped.
-        See Also
-        --------
-        ReplayBuffer.__init__
+        obs_shape, action_shape : tuple
+            Per-env shapes.
+        capacity : int
+            Max number of transitions to store. When the buffer overflows the
+            oldest memories are dropped.
+        device : torch.device
+        num_train : int | None
+            If set, ``add()`` slices its inputs to ``[:num_train]`` before storing.
+            Used when the caller passes observations from a larger vec-env whose
+            tail rows are validation envs that must not enter training data.
+            ``None`` preserves backward-compatible behavior (store every row).
         """
 
         self.device = device
+        self.num_train = num_train
 
         self.obses = torch.empty((capacity, *obs_shape), dtype=torch.float32, device=self.device)
         self.next_obses = torch.empty((capacity, *obs_shape), dtype=torch.float32, device=self.device)
@@ -231,6 +238,12 @@ class VectorizedReplayBuffer:
         self.full = False
 
     def add(self, obs, action, reward, next_obs, done):
+        if self.num_train is not None:
+            obs = obs[: self.num_train]
+            action = action[: self.num_train]
+            reward = reward[: self.num_train]
+            next_obs = next_obs[: self.num_train]
+            done = done[: self.num_train]
 
         num_observations = obs.shape[0]
         remaining_capacity = min(self.capacity - self.idx, num_observations)

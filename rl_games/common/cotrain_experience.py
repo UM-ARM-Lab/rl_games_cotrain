@@ -30,6 +30,8 @@ class CotrainExperienceBuffer:
     pass-through ExperienceBuffer.
     """
 
+    SCORING_MODES = ("binary", "softmax")
+
     def __init__(
         self,
         env_info: dict,
@@ -38,6 +40,11 @@ class CotrainExperienceBuffer:
         scorer=None,
         threshold: Optional[float] = None,
         sim_env_idx: Optional[torch.Tensor] = None,
+        scoring_mode: str = "binary",
+        temperature: Optional[float] = None,
+        plot_dir: Optional[str] = None,
+        plot_every: int = 1,
+        plot_num_trajectories: int = 10,
         writer=None,
     ):
         """
@@ -55,6 +62,21 @@ class CotrainExperienceBuffer:
                 (T, num_envs, *) buffer) that should be dynamics-scored.
                 Every other env is always accepted. Required whenever
                 `scorer` is set.
+            scoring_mode: "binary" (default, hard accept/reject at threshold)
+                or "softmax" (sampling weights ∝ exp(-score / temperature) on
+                scored sim cells; real / pre-history cells get weight 1.0).
+            temperature: Softmax temperature τ for mode="softmax" — sets the
+                sharpness of the weighting. τ ≈ threshold gives a transition
+                at the threshold a weight of exp(-1) ≈ 0.37 relative to a
+                score-0 transition. Required when scoring_mode="softmax".
+            plot_dir: If set, save a per-resample diagnostic PNG of randomly
+                sampled sim-env trajectories colored by per-chunk MSE into
+                this directory (created if missing). Intended for monitoring
+                the dynamics-scorer distribution shift over RL training.
+            plot_every: Save a plot every N resample() calls. plot_dir must
+                be set for this to fire.
+            plot_num_trajectories: How many random sim envs to render per
+                plot (capped at num_sim_envs).
             writer: Optional tensorboard SummaryWriter for logging.
         """
         self.buffer = ExperienceBuffer(env_info, algo_info, device)
@@ -62,14 +84,28 @@ class CotrainExperienceBuffer:
         self.writer = writer
         self._log_step = 0
 
+        assert scoring_mode in self.SCORING_MODES, (
+            f"scoring_mode must be one of {self.SCORING_MODES}, got {scoring_mode!r}"
+        )
+        self.scoring_mode = scoring_mode
+
+        self.plot_dir = plot_dir
+        self.plot_every = max(1, int(plot_every))
+        self.plot_num_trajectories = max(1, int(plot_num_trajectories))
+
         if scorer is not None:
             assert threshold is not None, "threshold is required when scorer is provided"
             assert sim_env_idx is not None, "sim_env_idx is required when scorer is provided"
             assert sim_env_idx.dim() == 1, (
                 f"sim_env_idx must be 1-D, got shape {tuple(sim_env_idx.shape)}"
             )
+            if scoring_mode == "softmax":
+                assert temperature is not None and float(temperature) > 0, (
+                    "temperature > 0 is required when scoring_mode='softmax'"
+                )
             self.scorer = scorer
             self.threshold = float(threshold)
+            self.temperature = float(temperature) if temperature is not None else None
             self._horizon = scorer.algo.horizon
             self._future_horizon = scorer.algo.future_horizon
             self.sim_env_idx = sim_env_idx.to(self.device).long()
@@ -86,6 +122,7 @@ class CotrainExperienceBuffer:
         else:
             self.scorer = None
             self.threshold = None
+            self.temperature = None
             self._horizon = None
             self._future_horizon = None
             self.sim_env_idx = None
@@ -135,107 +172,347 @@ class CotrainExperienceBuffer:
         T = td["dones"].shape[0]
         num_envs = td["dones"].shape[1]
 
-        # Build per-timestep mask (T, num_envs): 1 = accept, 0 = reject
-        mask = self._build_scoring_mask(td, T, num_envs)
+        # Score once; reuse for weight construction AND diagnostic plotting.
+        scores, chunk_starts = self._score_sim_chunks(td, T)
+        weights = self._build_scoring_weights_from_scores(
+            scores, chunk_starts, T, num_envs,
+        )
 
-        # Log scoring stats — accept rate is computed only over sim envs
-        if self.writer is not None:
-            accept_rate = mask.index_select(1, self.sim_env_idx).float().mean().item()
-            self.writer.add_scalar("cotrain/sim_accept_rate", accept_rate, self._log_step)
-            self._log_step += 1
-
-        # Resample: for each tensor in buffer, replace rejected rows
-        self._resample_buffer(td, mask, T, num_envs)
+        self._log_scoring_stats(weights)
+        self._maybe_save_resample_plot(td, scores, chunk_starts)
+        self._apply_resample(td, weights, T, num_envs)
 
         return rnn_states_raw
 
-    def _build_scoring_mask(self, td: dict, T: int, num_envs: int) -> torch.Tensor:
-        """Build (T, num_envs) binary mask. Sim envs (identified by sim_env_idx)
-        are scored; all other envs are always accepted (mask=1)."""
-        mask = torch.ones(T, num_envs, device=self.device)
+    # ------------------------------------------------------------------
+    # Weight construction (one method per mode, dispatched by scoring_mode)
+    # ------------------------------------------------------------------
 
+    def _build_scoring_weights_from_scores(
+        self,
+        scores: Optional[torch.Tensor],
+        chunk_starts: list,
+        T: int,
+        num_envs: int,
+    ) -> torch.Tensor:
+        """Build (T, num_envs) non-negative sampling weights from precomputed
+        per-chunk MSE scores. Real envs (complement of sim_env_idx) and
+        sim-env timesteps outside any scored chunk window always receive
+        weight 1.0. Scored sim chunks get their per-mode weight from
+        `_chunk_weight_<mode>`.
+        """
+        weights = torch.ones(T, num_envs, device=self.device)
         num_sim = int(self.sim_env_idx.numel())
-        if num_sim == 0:
-            return mask
+        if num_sim == 0 or scores is None:
+            return weights
 
-        # Gather sim-env data for scoring using the concrete env indices.
-        # collect_obses: (T, num_envs, state_dim) -- stored during play_steps
-        collect_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, num_sim, D_s)
-        actions = td["actions"].index_select(1, self.sim_env_idx)              # (T, num_sim, D_a)
+        chunk_weight = self._chunk_weight_fn()(scores)                  # (K, N_sim)
+        sim_w = self._paint_chunk_weights_onto_timesteps(
+            chunk_weight, chunk_starts, T, num_sim,
+        )
+        weights[:, self.sim_env_idx] = sim_w
+        return weights
 
+    def _chunk_weight_fn(self):
+        """Dispatch to the per-mode chunk-weight function."""
+        if self.scoring_mode == "binary":
+            return self._chunk_weight_binary
+        if self.scoring_mode == "softmax":
+            return self._chunk_weight_softmax
+        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
+
+    def _chunk_weight_binary(self, scores: torch.Tensor) -> torch.Tensor:
+        """Hard accept/reject: 1 where score ≤ threshold, 0 otherwise."""
+        return (scores <= self.threshold).float()
+
+    def _chunk_weight_softmax(self, scores: torch.Tensor) -> torch.Tensor:
+        """Soft weights ∝ exp(-score / τ). In (0, 1] with max at score=0."""
+        return torch.exp(-scores / self.temperature)
+
+    def _score_sim_chunks(self, td: dict, T: int):
+        """Extract sim-env chunks, run the scorer, return (scores, chunk_starts).
+
+        Returns `(None, [])` when the rollout is too short for any valid chunk.
+        """
         H = self._horizon
         F = self._future_horizon
-
-        # Non-overlapping chunks: chunk i starts at t = i*F
         chunk_starts = list(range(0, T - H - F + 1, F))
         if len(chunk_starts) == 0:
-            # Trajectory too short for any valid segment -- accept all
-            return mask
+            return None, []
 
-        num_chunks = len(chunk_starts)
+        num_sim = int(self.sim_env_idx.numel())
+        collect_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
+        actions = td["actions"].index_select(1, self.sim_env_idx)              # (T, N_sim, D_a)
 
-        # Build batched scorer input: (num_chunks * num_sim, H, D_s) etc.
-        all_state_0 = []
-        all_actions = []
-        all_state_gt = []
+        all_state_0, all_actions, all_state_gt = [], [], []
         for t in chunk_starts:
-            all_state_0.append(collect_obses[t:t + H])          # (H, num_sim, D_s)
-            all_actions.append(actions[t + H:t + H + F])         # (F, num_sim, D_a)
-            all_state_gt.append(collect_obses[t + H:t + H + F]) # (F, num_sim, D_s)
+            all_state_0.append(collect_obses[t:t + H])
+            all_actions.append(actions[t + H:t + H + F])
+            all_state_gt.append(collect_obses[t + H:t + H + F])
 
-        # Stack: (num_chunks, H/F, num_sim, D) -> reshape to (num_chunks*num_sim, H/F, D)
-        state_0 = torch.stack(all_state_0).permute(0, 2, 1, 3).reshape(num_chunks * num_sim, H, -1)
-        future_actions = torch.stack(all_actions).permute(0, 2, 1, 3).reshape(num_chunks * num_sim, F, -1)
-        state_gt = torch.stack(all_state_gt).permute(0, 2, 1, 3).reshape(num_chunks * num_sim, F, -1)
+        K = len(chunk_starts)
+        state_0 = torch.stack(all_state_0).permute(0, 2, 1, 3).reshape(K * num_sim, H, -1)
+        future_actions = torch.stack(all_actions).permute(0, 2, 1, 3).reshape(K * num_sim, F, -1)
+        state_gt = torch.stack(all_state_gt).permute(0, 2, 1, 3).reshape(K * num_sim, F, -1)
 
-        # Score all segments
         data = {"state_0": state_0, "actions": future_actions, "state_gt": state_gt}
-        scores = self.scorer.score(data, mode="mse")  # (num_chunks * num_sim,)
-        scores = scores.reshape(num_chunks, num_sim)   # (num_chunks, num_sim)
+        scores = self.scorer.score(data, mode="mse").reshape(K, num_sim)
+        return scores, chunk_starts
 
-        # Binary mask per chunk: 1 if score <= threshold
-        chunk_accept = (scores <= self.threshold).float()  # (num_chunks, num_sim)
-
-        # Expand chunk mask to per-timestep mask for sim envs
-        sim_mask = torch.ones(T, num_sim, device=self.device)
+    def _paint_chunk_weights_onto_timesteps(
+        self, chunk_weight: torch.Tensor, chunk_starts, T: int, num_sim: int,
+    ) -> torch.Tensor:
+        """Expand (K, N_sim) per-chunk weights onto a (T, N_sim) per-timestep
+        tensor. Timesteps not covered by any chunk's future window stay at 1.0."""
+        sim_w = torch.ones(T, num_sim, device=self.device)
+        F = self._future_horizon
+        H = self._horizon
         for i, t in enumerate(chunk_starts):
-            # The scored region is [t+H, t+H+F) -- the future window
-            sim_mask[t + H:t + H + F] = chunk_accept[i].unsqueeze(0).expand(F, -1)
+            sim_w[t + H:t + H + F] = chunk_weight[i].unsqueeze(0).expand(F, -1)
+        return sim_w
 
-        mask[:, self.sim_env_idx] = sim_mask
-        return mask
+    # ------------------------------------------------------------------
+    # Sampling (one method per mode, dispatched by scoring_mode)
+    # ------------------------------------------------------------------
 
-    def _resample_buffer(self, td: dict, mask: torch.Tensor, T: int, num_envs: int):
-        """Resample buffer in-place: replace rejected timesteps with accepted ones.
-
-        After swap_and_flatten01, PPO expects (T*num_envs,) flat tensors.
-        We flatten the mask, find accepted indices, and sample with replacement
-        to fill the original batch size.
-        """
-        flat_mask = mask.reshape(-1)  # (T * num_envs,)
-        accepted_idx = flat_mask.nonzero(as_tuple=True)[0]
-
-        if accepted_idx.numel() == 0:
-            # Degenerate: all rejected -- keep buffer unchanged
-            return
-
+    def _apply_resample(self, td: dict, weights: torch.Tensor, T: int, num_envs: int):
+        """Draw sample_idx via the per-mode sampler and shuffle every field in
+        `td` shaped (T, num_envs, *) by the SAME indices. Sharing sample_idx
+        across fields preserves row-wise relationships (e.g. returns - values
+        -> advantages) post-resample."""
+        flat_w = weights.reshape(-1)
         total = T * num_envs
-        if accepted_idx.numel() == total:
-            # All accepted -- no resampling needed
+        sample_idx = self._sample_idx_fn()(flat_w, total)
+        if sample_idx is None:
             return
-
-        # Sample with replacement from accepted indices
-        sample_idx = accepted_idx[torch.randint(0, accepted_idx.numel(), (total,), device=self.device)]
-
-        # Apply resampling to all tensor fields in the buffer
         for key, val in td.items():
             if not isinstance(val, torch.Tensor):
                 continue
             if val.shape[0] != T or (val.ndim >= 2 and val.shape[1] != num_envs):
                 continue
-            # Flatten (T, num_envs, *) -> (T*num_envs, *), resample, reshape back
             flat_shape = (total, *val.shape[2:])
             td[key] = val.reshape(flat_shape)[sample_idx].reshape(val.shape)
+
+    def _sample_idx_fn(self):
+        """Dispatch to the per-mode sample-index function."""
+        if self.scoring_mode == "binary":
+            return self._sample_idx_binary
+        if self.scoring_mode == "softmax":
+            return self._sample_idx_softmax
+        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
+
+    def _sample_idx_binary(self, flat_w: torch.Tensor, total: int) -> Optional[torch.Tensor]:
+        """Uniform sample (with replacement) over cells with weight > 0.
+        Returns None when every cell is accepted (no-op) or nothing is (degenerate)."""
+        accepted_idx = flat_w.nonzero(as_tuple=True)[0]
+        if accepted_idx.numel() == 0:
+            return None
+        if accepted_idx.numel() == total:
+            return None
+        return accepted_idx[torch.randint(0, accepted_idx.numel(), (total,), device=self.device)]
+
+    def _sample_idx_softmax(self, flat_w: torch.Tensor, total: int) -> Optional[torch.Tensor]:
+        """Multinomial sample (with replacement) proportional to flat_w.
+        torch.multinomial normalizes internally; weights need not sum to 1."""
+        if flat_w.sum() <= 0:
+            return None
+        return torch.multinomial(flat_w, total, replacement=True)
+
+    # ------------------------------------------------------------------
+    # Logging (per-mode stats)
+    # ------------------------------------------------------------------
+
+    def _log_scoring_stats(self, weights: torch.Tensor) -> None:
+        # _log_step advances on every resample so it can name plot files
+        # consistently even when the tensorboard writer is absent.
+        self._log_step += 1
+        if self.writer is None:
+            return
+        sim_w = weights.index_select(1, self.sim_env_idx)
+        if self.scoring_mode == "binary":
+            self._log_stats_binary(sim_w)
+        elif self.scoring_mode == "softmax":
+            self._log_stats_softmax(sim_w)
+
+    def _log_stats_binary(self, sim_w: torch.Tensor) -> None:
+        self.writer.add_scalar(
+            "cotrain/sim_accept_rate", sim_w.float().mean().item(), self._log_step,
+        )
+
+    def _log_stats_softmax(self, sim_w: torch.Tensor) -> None:
+        w_flat = sim_w.reshape(-1)
+        total = w_flat.numel()
+        ess = (w_flat.sum() ** 2) / (w_flat.pow(2).sum().clamp_min(1e-12))
+        self.writer.add_scalar(
+            "cotrain/sim_weight_mean", w_flat.mean().item(), self._log_step,
+        )
+        self.writer.add_scalar(
+            "cotrain/sim_weight_ess_norm", (ess / total).item(), self._log_step,
+        )
+
+    # ------------------------------------------------------------------
+    # Diagnostic plotting (per-resample distribution-shift monitor)
+    # ------------------------------------------------------------------
+
+    def _maybe_save_resample_plot(
+        self,
+        td: dict,
+        scores: Optional[torch.Tensor],
+        chunk_starts: list,
+    ) -> None:
+        """Save diagnostic PNGs of sim-env data being scored by the dynamics
+        model. Renders (a) per-chunk MSE coloring on sampled trajectories and
+        (b) per-chunk scorer prediction vs actual-rollout 3D comparisons for a
+        handful of random chunks — intended for monitoring dynamics-scorer
+        distribution shift over the course of RL training."""
+        if self.plot_dir is None or scores is None or len(chunk_starts) == 0:
+            return
+        # _log_step was just incremented in _log_scoring_stats, so the first
+        # call writes step_1 rather than step_0.
+        if self._log_step % self.plot_every != 0:
+            return
+
+        import logging, os
+        # Silence third-party DEBUG spam that floods logs when the upstream
+        # logger is configured at DEBUG level (Hydra, etc.):
+        # - matplotlib.font_manager: per-font scoring on every plot call
+        # - PIL.PngImagePlugin / PIL.Image: chunk parsing on every PNG save
+        for _name in ("matplotlib", "PIL"):
+            logging.getLogger(_name).setLevel(logging.WARNING)
+
+        os.makedirs(self.plot_dir, exist_ok=True)
+        step_tag = f"step_{self._log_step:05d}"
+
+        self._plot_scoring_overview(td, scores, chunk_starts, step_tag)
+        self._plot_chunk_pred_vs_actual(td, scores, chunk_starts, step_tag)
+
+    def _plot_scoring_overview(
+        self,
+        td: dict,
+        scores: torch.Tensor,
+        chunk_starts: list,
+        step_tag: str,
+    ) -> None:
+        """Two trajectory-level views: per-chunk MSE heat map + binary accept/reject."""
+        sim_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
+        N_sim = sim_obses.shape[1]
+        k = min(int(self.plot_num_trajectories), N_sim)
+        rand_idx = torch.randperm(N_sim, device=self.device)[:k]
+
+        trajs = sim_obses.index_select(1, rand_idx).permute(1, 0, 2).detach().cpu().numpy()  # (k, T, D_s)
+        seg_scores = scores.index_select(1, rand_idx).permute(1, 0).detach().cpu().numpy()    # (k, K)
+
+        # Local imports keep matplotlib dependency out of hot paths when plotting is off.
+        from dynamics_cotrain.visualization.scorer_plot import (
+            plot_stepwise_evaluation, plot_stepwise_accept_reject,
+        )
+        import matplotlib.pyplot as plt
+        import os
+
+        metric_name = (
+            f"Chunked MSE (softmax τ={self.temperature:.5f})"
+            if self.scoring_mode == "softmax" else
+            f"Chunked MSE (binary, thr={self.threshold:.5f})"
+        )
+
+        fig_eval = plot_stepwise_evaluation(
+            trajectories=trajs,
+            segment_scores=seg_scores,
+            chunk_starts=list(chunk_starts),
+            horizon=self._horizon,
+            future_horizon=self._future_horizon,
+            metric_name=metric_name,
+            title=f"Cotrain resample {step_tag}",
+            save_path=os.path.join(self.plot_dir, f"{step_tag}_stepwise.png"),
+        )
+        plt.close(fig_eval)
+
+        fig_ar = plot_stepwise_accept_reject(
+            trajectories=trajs,
+            segment_scores=seg_scores,
+            chunk_starts=list(chunk_starts),
+            horizon=self._horizon,
+            future_horizon=self._future_horizon,
+            threshold=self.threshold,
+            metric_name=metric_name,
+            title=f"Cotrain resample {step_tag} (accept/reject @ threshold)",
+            save_path=os.path.join(self.plot_dir, f"{step_tag}_accept_reject.png"),
+        )
+        plt.close(fig_ar)
+
+    def _plot_chunk_pred_vs_actual(
+        self,
+        td: dict,
+        scores: torch.Tensor,
+        chunk_starts: list,
+        step_tag: str,
+    ) -> None:
+        """For ``plot_num_trajectories`` random (env, chunk) pairs, render the
+        scorer's predicted rollout against the actual state_gt rollout in 3D
+        (dims 0:3). Mirrors the `_run_validation` helper in exp_dynamics."""
+        K = scores.shape[0]
+        N_sim = scores.shape[1]
+        total_chunks = K * N_sim
+        if total_chunks == 0:
+            return
+        n_plots = min(int(self.plot_num_trajectories), total_chunks)
+
+        flat_pick = torch.randperm(total_chunks, device=self.device)[:n_plots]
+        chunk_idx = (flat_pick // N_sim).cpu().tolist()   # index into chunk_starts
+        env_idx = (flat_pick % N_sim).cpu().tolist()       # sim env index
+
+        sim_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
+        sim_actions = td["actions"].index_select(1, self.sim_env_idx)      # (T, N_sim, D_a)
+
+        H = self._horizon
+        F = self._future_horizon
+        state_0_list, actions_list, state_gt_list = [], [], []
+        for ci, ei in zip(chunk_idx, env_idx):
+            t0 = chunk_starts[ci]
+            state_0_list.append(sim_obses[t0:t0 + H, ei])
+            actions_list.append(sim_actions[t0 + H:t0 + H + F, ei])
+            state_gt_list.append(sim_obses[t0 + H:t0 + H + F, ei])
+        state_0 = torch.stack(state_0_list)     # (n_plots, H, D_s)
+        actions = torch.stack(actions_list)     # (n_plots, F, D_a)
+        state_gt = torch.stack(state_gt_list)   # (n_plots, F, D_s)
+
+        # predict() handles normalize → algo → unnormalize, so mu comes back
+        # in raw state space — directly comparable to state_gt.
+        mu, log_var, _ = self.scorer.predict({"state_0": state_0, "actions": actions})
+
+        import os
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from dynamics_cotrain.visualization.scorer_plot import plot_3d_trajectory_with_uncertainty
+
+        mu_np = mu.detach().cpu().numpy()
+        log_var_np = log_var.detach().cpu().numpy()
+        state_gt_np = state_gt.detach().cpu().numpy()
+        state_0_np = state_0.detach().cpu().numpy()
+        scores_np = scores.detach().cpu().numpy()
+
+        for i in range(n_plots):
+            init = state_0_np[i, -1:]                                    # (1, D_s)
+            gt = np.concatenate([init, state_gt_np[i]], axis=0)          # (F+1, D_s)
+            pred = np.concatenate([init, mu_np[i]], axis=0)              # (F+1, D_s)
+            zero = np.zeros_like(init)
+            var = np.concatenate([zero, log_var_np[i]], axis=0)
+            ci, ei = chunk_idx[i], env_idx[i]
+            score_val = float(scores_np[ci, ei])
+            fig = plot_3d_trajectory_with_uncertainty(
+                ground_truth=gt,
+                predicted=pred,
+                dim_indices=[0, 1, 2],
+                dim_names=["X", "Y", "Z"],
+                variance=var,
+                title=(f"{step_tag} | env={ei} chunk={ci} "
+                       f"(t0={chunk_starts[ci]}) MSE={score_val:.5f}"),
+                figsize=(9, 7),
+                save_path=os.path.join(
+                    self.plot_dir, f"{step_tag}_pred_vs_actual_{i:02d}.png",
+                ),
+            )
+            plt.close(fig)
 
     # ------------------------------------------------------------------
     # Transform pass-throughs (used by play_steps after resample)

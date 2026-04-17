@@ -575,6 +575,11 @@ class A2CBase(BaseAlgorithm):
                 scorer=self.cotrain_cfg.get("scorer_object", None),
                 threshold=self.cotrain_cfg.get("scorer_threshold", None),
                 sim_env_idx=self.cotrain_cfg.get("sim_env_idx", None),
+                scoring_mode=self.cotrain_cfg.get("scoring_mode", "binary"),
+                temperature=self.cotrain_cfg.get("temperature", None),
+                plot_dir=self.cotrain_cfg.get("plot_dir", None),
+                plot_every=self.cotrain_cfg.get("plot_every", 1),
+                plot_num_trajectories=self.cotrain_cfg.get("plot_num_trajectories", 10),
                 writer=self.writer,
             )
 

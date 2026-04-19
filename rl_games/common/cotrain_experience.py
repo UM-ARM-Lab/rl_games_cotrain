@@ -109,16 +109,6 @@ class CotrainExperienceBuffer:
             self._horizon = scorer.algo.horizon
             self._future_horizon = scorer.algo.future_horizon
             self.sim_env_idx = sim_env_idx.to(self.device).long()
-
-            # Pre-allocate the collect_obses buffer slot. ExperienceBuffer only
-            # initializes standard RL Games keys (obses, actions, …); the env's
-            # low-dim collect_obs stream that the scorer consumes is not one of
-            # them, so `update_data("collect_obses", ...)` in play_steps would
-            # otherwise hit a missing key. Shape mirrors obs_base_shape.
-            T, N = self.buffer.obs_base_shape
-            self.buffer.tensor_dict["collect_obses"] = torch.zeros(
-                (T, N, scorer.algo.state_dim), dtype=torch.float32, device=self.device,
-            )
         else:
             self.scorer = None
             self.threshold = None
@@ -241,14 +231,14 @@ class CotrainExperienceBuffer:
             return None, []
 
         num_sim = int(self.sim_env_idx.numel())
-        collect_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
-        actions = td["actions"].index_select(1, self.sim_env_idx)              # (T, N_sim, D_a)
+        sim_obses = td["obses"].index_select(1, self.sim_env_idx)    # (T, N_sim, D_s)
+        actions = td["actions"].index_select(1, self.sim_env_idx)    # (T, N_sim, D_a)
 
         all_state_0, all_actions, all_state_gt = [], [], []
         for t in chunk_starts:
-            all_state_0.append(collect_obses[t:t + H])
-            all_actions.append(actions[t + H:t + H + F])
-            all_state_gt.append(collect_obses[t + H:t + H + F])
+            all_state_0.append(sim_obses[t:t + H])
+            all_actions.append(actions[t + H - 1:t + H - 1 + F])
+            all_state_gt.append(sim_obses[t + H:t + H + F])
 
         K = len(chunk_starts)
         state_0 = torch.stack(all_state_0).permute(0, 2, 1, 3).reshape(K * num_sim, H, -1)
@@ -394,7 +384,7 @@ class CotrainExperienceBuffer:
         step_tag: str,
     ) -> None:
         """Two trajectory-level views: per-chunk MSE heat map + binary accept/reject."""
-        sim_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
+        sim_obses = td["obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
         N_sim = sim_obses.shape[1]
         k = min(int(self.plot_num_trajectories), N_sim)
         rand_idx = torch.randperm(N_sim, device=self.device)[:k]
@@ -461,7 +451,7 @@ class CotrainExperienceBuffer:
         chunk_idx = (flat_pick // N_sim).cpu().tolist()   # index into chunk_starts
         env_idx = (flat_pick % N_sim).cpu().tolist()       # sim env index
 
-        sim_obses = td["collect_obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
+        sim_obses = td["obses"].index_select(1, self.sim_env_idx)  # (T, N_sim, D_s)
         sim_actions = td["actions"].index_select(1, self.sim_env_idx)      # (T, N_sim, D_a)
 
         H = self._horizon
@@ -470,7 +460,7 @@ class CotrainExperienceBuffer:
         for ci, ei in zip(chunk_idx, env_idx):
             t0 = chunk_starts[ci]
             state_0_list.append(sim_obses[t0:t0 + H, ei])
-            actions_list.append(sim_actions[t0 + H:t0 + H + F, ei])
+            actions_list.append(sim_actions[t0 + H - 1:t0 + H - 1 + F, ei])
             state_gt_list.append(sim_obses[t0 + H:t0 + H + F, ei])
         state_0 = torch.stack(state_0_list)     # (n_plots, H, D_s)
         actions = torch.stack(actions_list)     # (n_plots, F, D_a)

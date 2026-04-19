@@ -898,14 +898,6 @@ class A2CBase(BaseAlgorithm):
                 step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
             self.obs, rewards, self.dones, infos = self.env_step(step_actions)
 
-            # Store collect_obs for dynamics scoring (low_dim_state from env).
-            # Gated on scoring_enabled because the "collect_obses" slot is only
-            # pre-allocated in CotrainExperienceBuffer when a scorer is attached.
-            if self.cotrain_enabled and self.experience_buffer.scoring_enabled \
-                    and hasattr(self.vec_env.env, 'unwrapped'):
-                collect_obs = self.vec_env.env.unwrapped.collect_obs.clone()
-                self.experience_buffer.update_data("collect_obses", n, collect_obs)
-
             step_time_end = time.time()
 
             step_time += step_time_end - step_time_start
@@ -1017,14 +1009,6 @@ class A2CBase(BaseAlgorithm):
                 step_actions = step_actions.clone()
                 step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
             self.obs, rewards, self.dones, infos = self.env_step(step_actions)
-
-            # Store collect_obs for dynamics scoring (low_dim_state from env).
-            # Gated on scoring_enabled because the "collect_obses" slot is only
-            # pre-allocated in CotrainExperienceBuffer when a scorer is attached.
-            if self.cotrain_enabled and self.experience_buffer.scoring_enabled \
-                    and hasattr(self.vec_env.env, 'unwrapped'):
-                collect_obs = self.vec_env.env.unwrapped.collect_obs.clone()
-                self.experience_buffer.update_data("collect_obses", n, collect_obs)
 
             step_time_end = time.time()
 

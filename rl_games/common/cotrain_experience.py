@@ -584,7 +584,7 @@ class CotrainExperienceBuffer:
 
 
 class CotrainVectorizedReplayBuffer:
-    """Dual replay buffer for SAC co-training with per-episode score weighting.
+    """Dual replay buffer for SAC co-training with chunk-scoring at episode-end.
 
     Accepts full ``(num_total_envs, ...)`` tensors on ``add()``. Rows for
     validation envs (the last ``num_total_envs - num_train_real - num_train_sim``
@@ -596,9 +596,8 @@ class CotrainVectorizedReplayBuffer:
         obs[num_train_real+num_train_sim : ]           -> dropped (val envs)
 
     This contiguous assumption requires ``randomize_partition=False`` on the
-    environment. When a scorer is provided, per-env episode scores are updated
-    via ``traj_resampler.score_episode`` when a done fires, and sim transitions
-    are sampled proportionally to their env's current score.
+    environment. When a scorer is provided, per-slot weights are backfilled at
+    episode-end via ChunkScorer (same chunking + binary/softmax dispatch as PPO).
     """
 
     def __init__(
@@ -611,8 +610,13 @@ class CotrainVectorizedReplayBuffer:
         num_train_sim: int,
         num_total_envs: int,
         real_data_ratio: float = 0.3,
-        traj_resampler=None,
-        train_scorer: bool = False,
+        scorer=None,
+        threshold: Optional[float] = None,
+        scoring_mode: str = "binary",
+        temperature: Optional[float] = None,
+        plot_dir: Optional[str] = None,
+        plot_every: int = 1,
+        plot_num_trajectories: int = 10,
         writer=None,
     ):
         assert num_total_envs >= num_train_real + num_train_sim, (
@@ -626,9 +630,10 @@ class CotrainVectorizedReplayBuffer:
         self.num_train = num_train_real + num_train_sim
         self.num_total_envs = num_total_envs
         self.real_data_ratio = real_data_ratio
-        self.traj_resampler = traj_resampler
-        self.train_scorer = train_scorer
         self.writer = writer
+        self.plot_dir = plot_dir
+        self.plot_every = max(1, int(plot_every))
+        self.plot_num_trajectories = max(1, int(plot_num_trajectories))
         self._log_step = 0
 
         # Proportional capacity split. When one side has no envs, its capacity is 0.
@@ -649,27 +654,41 @@ class CotrainVectorizedReplayBuffer:
             if sim_cap > 0 and num_train_sim > 0 else None
         )
 
-        # Per-slot env_id (position within [0, num_train_sim)) for sim weighted sampling.
-        # Layout mirrors VectorizedReplayBuffer's write order so a slot's sim env id
-        # matches the obs that was written there.
-        self._sim_env_ids = (
-            torch.zeros(sim_cap, dtype=torch.long, device=device)
+        # Zero-initialize obs tensors so unwritten regions are identifiably empty.
+        if self._real_buf is not None:
+            self._real_buf.obses.zero_()
+        if self._sim_buf is not None:
+            self._sim_buf.obses.zero_()
+
+        # Per-slot sampling weight; parallel to self._sim_buf data tensors.
+        # Owned by this wrapper, not monkey-patched onto VectorizedReplayBuffer.
+        self._sim_weights = (
+            torch.ones(sim_cap, dtype=torch.float32, device=device)
             if sim_cap > 0 else None
         )
-        # Per-env episode score; defaults to 1.0 until first episode completes.
-        self._sim_scores = (
-            torch.ones(num_train_sim, dtype=torch.float32, device=device)
-            if num_train_sim > 0 else None
+
+        # Build chunk scorer when a scorer is provided. When None, the
+        # _acc_* accumulators are left empty (no append on add()) and sample()
+        # falls through to uniform on the sim path.
+        self._chunk_scorer = (
+            ChunkScorer(
+                scorer=scorer, threshold=threshold,
+                scoring_mode=scoring_mode, temperature=temperature, device=device,
+            )
+            if scorer is not None else None
         )
+
         # Per-sim-env episode accumulators cleared on done.
-        self._acc_obs: list = [[] for _ in range(num_train_sim)]
-        self._acc_act: list = [[] for _ in range(num_train_sim)]
+        self._acc_obs:   list[list[torch.Tensor]] = [[] for _ in range(num_train_sim)]
+        self._acc_act:   list[list[torch.Tensor]] = [[] for _ in range(num_train_sim)]
+        self._acc_slots: list[list[int]]          = [[] for _ in range(num_train_sim)]
 
         print(
             f"[CotrainVectorizedReplayBuffer] train_real={num_train_real} "
             f"train_sim={num_train_sim} num_total_envs={num_total_envs} "
             f"real_cap={real_cap} sim_cap={sim_cap} "
-            f"scorer={type(traj_resampler).__name__ if traj_resampler else 'None'}"
+            f"scorer={'on' if self._chunk_scorer is not None else 'off'} "
+            f"mode={scoring_mode if self._chunk_scorer is not None else 'n/a'}"
         )
 
     # SACAgent polls these for logging/compat with VectorizedReplayBuffer.
@@ -686,19 +705,14 @@ class CotrainVectorizedReplayBuffer:
         return self._real_buf.full if self._real_buf is not None else False
 
     def add(self, obs, action, reward, next_obs, done):
-        """Add one step from all envs.
-
-        Args:
-            obs:      (num_total_envs, *obs_shape)
-            action:   (num_total_envs, *action_shape)
-            reward:   (num_total_envs, 1)
-            next_obs: (num_total_envs, *obs_shape)
-            done:     (num_total_envs, 1)
+        """Add one step from all envs. Layout:
+            obs[0 : num_train_real]                     -> real_buf
+            obs[num_train_real : num_train]             -> sim_buf
+            obs[num_train : ]                           -> dropped (val envs)
         """
         assert obs.shape[0] == self.num_total_envs, (
             f"expected obs.shape[0]={self.num_total_envs}, got {obs.shape[0]}"
         )
-
         real_end = self.num_train_real
         sim_end = self.num_train_real + self.num_train_sim
 
@@ -712,7 +726,6 @@ class CotrainVectorizedReplayBuffer:
                 obs[real_end:sim_end], action[real_end:sim_end], reward[real_end:sim_end],
                 next_obs[real_end:sim_end], done[real_end:sim_end],
             )
-        # obs[sim_end:] are val envs -- intentionally dropped.
 
     def _add_sim(self, obs, action, reward, next_obs, done):
         num_sim = obs.shape[0]
@@ -721,55 +734,70 @@ class CotrainVectorizedReplayBuffer:
         remaining = min(cap - old_idx, num_sim)
         overflow = num_sim - remaining
 
-        # Mirror VectorizedReplayBuffer's write layout to tag each slot with its sim env id.
+        # Compute the per-env slot indices the same way VectorizedReplayBuffer
+        # writes them, so accumulator slot ids match the data row physically
+        # written into _sim_buf.
         if remaining > 0:
-            self._sim_env_ids[old_idx : old_idx + remaining] = torch.arange(
-                remaining, device=self.device
-            )
+            head_slots = torch.arange(old_idx, old_idx + remaining, device=self.device)
+        else:
+            head_slots = torch.empty(0, dtype=torch.long, device=self.device)
         if overflow > 0:
-            self._sim_env_ids[0:overflow] = torch.arange(
-                remaining, num_sim, device=self.device
-            )
+            tail_slots = torch.arange(0, overflow, device=self.device)
+        else:
+            tail_slots = torch.empty(0, dtype=torch.long, device=self.device)
+        slot_ids = torch.cat([head_slots, tail_slots])  # (num_sim,)
+
+        # Default-fill new slots with weight 1.0 so sample() is well-defined
+        # before any episode finishes.
+        self._sim_weights[slot_ids] = 1.0
 
         self._sim_buf.add(obs, action, reward, next_obs, done)
 
-        if self.traj_resampler is None:
+        if self._chunk_scorer is None:
             return
 
+        # Accumulate per-env episode buffers; backfill weights on done.
         done_flat = done.squeeze(-1)
         for i in range(num_sim):
             self._acc_obs[i].append(obs[i])
             self._acc_act[i].append(action[i])
+            self._acc_slots[i].append(int(slot_ids[i].item()))
             if done_flat[i].item():
                 self._score_episode(i)
 
     def _score_episode(self, env_i: int):
-        """Score completed sim episode and update per-env weight."""
+        """Score completed sim episode and backfill per-slot weights on _sim_weights."""
         acc_obs = self._acc_obs[env_i]
         acc_act = self._acc_act[env_i]
+        acc_slots = self._acc_slots[env_i]
         self._acc_obs[env_i] = []
         self._acc_act[env_i] = []
+        self._acc_slots[env_i] = []
 
-        if len(acc_obs) == 0:
+        L = len(acc_obs)
+        if L == 0:
             return
 
-        states = torch.stack(acc_obs)
-        actions = torch.stack(acc_act)
-        with torch.no_grad():
-            score = float(self.traj_resampler.score_episode(states, actions))
+        states = torch.stack(acc_obs)                           # (L, D_s)
+        actions = torch.stack(acc_act)                          # (L, D_a)
+        slots = torch.tensor(acc_slots, dtype=torch.long, device=self.device)
 
-        self._sim_scores[env_i] = score
+        # Reuse PPO chunking by treating the episode as (L, N=1, *).
+        sim_obses_TN1 = states.unsqueeze(1)
+        sim_actions_TN1 = actions.unsqueeze(1)
+        scores, starts = self._chunk_scorer.score_chunks(sim_obses_TN1, sim_actions_TN1)
+        if scores is None:
+            return  # episode shorter than H + F: leave slot weights at 1.0
+
+        weights_TN = self._chunk_scorer.paint_weights(scores, starts, T=L, N=1)
+        self._sim_weights[slots] = weights_TN.squeeze(1)
+
         if self.writer is not None:
-            self.writer.add_scalar("cotrain/sim_score", score, self._log_step)
             self._log_step += 1
-
-        if self.train_scorer:
-            self.traj_resampler.scorer_train_step(
-                {"obses": states.unsqueeze(1), "actions": actions.unsqueeze(1)}
-            )
+            self._chunk_scorer.log_stats(weights_TN, self.writer, self._log_step)
 
     def sample(self, batch_size: int):
-        """Sample a combined batch: score-weighted sim + uniform real."""
+        """Sample a combined batch: weighted sim (when scorer is on) + uniform real."""
         sim_size = (
             self._sim_buf.capacity if self._sim_buf.full else self._sim_buf.idx
         ) if self._sim_buf is not None else 0
@@ -787,9 +815,12 @@ class CotrainVectorizedReplayBuffer:
 
         parts = []
         if num_sim > 0:
-            if self.traj_resampler is not None:
-                weights = self._sim_scores[self._sim_env_ids[:sim_size]].clamp(min=1e-6)
-                sim_idx = torch.multinomial(weights, num_sim, replacement=True)
+            if self._chunk_scorer is not None:
+                sim_idx = self._chunk_scorer.sample_idx(
+                    self._sim_weights[:sim_size], num_sim,
+                )
+                if sim_idx is None:
+                    sim_idx = torch.randint(0, sim_size, (num_sim,), device=self.device)
             else:
                 sim_idx = torch.randint(0, sim_size, (num_sim,), device=self.device)
             parts.append((
@@ -829,8 +860,13 @@ class CotrainVectorizedReplayBuffer:
             stats["cotrain/real_buffer_size"] = (
                 self._real_buf.capacity if self._real_buf.full else self._real_buf.idx
             )
-        if self._sim_scores is not None:
-            stats["cotrain/sim_score_mean"] = self._sim_scores.mean().item()
-            stats["cotrain/sim_score_min"] = self._sim_scores.min().item()
-            stats["cotrain/sim_score_max"] = self._sim_scores.max().item()
+        if self._chunk_scorer is not None and self._sim_weights is not None:
+            sim_size = (
+                self._sim_buf.capacity if self._sim_buf.full else self._sim_buf.idx
+            )
+            if sim_size > 0:
+                w = self._sim_weights[:sim_size]
+                stats["cotrain/sim_weight_mean"] = w.mean().item()
+                stats["cotrain/sim_weight_min"] = w.min().item()
+                stats["cotrain/sim_weight_max"] = w.max().item()
         return stats

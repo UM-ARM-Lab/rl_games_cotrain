@@ -16,6 +16,147 @@ import torch
 from rl_games.common.experience import ExperienceBuffer, VectorizedReplayBuffer
 
 
+class ChunkScorer:
+    """Chunked-MSE scoring helper shared by CotrainExperienceBuffer (PPO) and
+    CotrainVectorizedReplayBuffer (SAC).
+
+    Stateless wrt rollout data: `score_chunks` consumes (T, N, *) sim-only
+    tensors and returns ((K, N) MSE, K chunk-start timesteps); `paint_weights`
+    expands per-chunk weights onto a (T, N) per-timestep grid via per-mode
+    dispatch (binary or softmax); `sample_idx` returns a multinomial / uniform
+    sample over a flat weight vector; `log_stats` writes per-mode tensorboard
+    scalars.
+
+    Owned config: scorer (BaseScorer-like), threshold (float), scoring_mode
+    ("binary" | "softmax"), temperature (float, softmax-only), device.
+    """
+
+    SCORING_MODES = ("binary", "softmax")
+
+    def __init__(self, scorer, threshold, scoring_mode, temperature, device):
+        assert scorer is not None
+        assert threshold is not None, "threshold required when scoring is enabled"
+        assert scoring_mode in self.SCORING_MODES, (
+            f"scoring_mode must be one of {self.SCORING_MODES}, got {scoring_mode!r}"
+        )
+        if scoring_mode == "softmax":
+            assert temperature is not None and float(temperature) > 0, (
+                "temperature > 0 is required when scoring_mode='softmax'"
+            )
+        self.scorer = scorer
+        self.threshold = float(threshold)
+        self.scoring_mode = scoring_mode
+        self.temperature = float(temperature) if temperature is not None else None
+        self.device = device
+
+    @property
+    def horizon(self) -> int:
+        return self.scorer.algo.horizon
+
+    @property
+    def future_horizon(self) -> int:
+        return self.scorer.algo.future_horizon
+
+    def score_chunks(self, sim_obses, sim_actions):
+        """Extract sim chunks and run the scorer.
+
+        Args:
+            sim_obses:   (T, N, D_s)
+            sim_actions: (T, N, D_a)
+        Returns:
+            (scores: (K, N) | None, chunk_starts: list[int])
+            (None, []) when T < H + F (rollout too short for any valid chunk).
+        """
+        H = self.horizon
+        F = self.future_horizon
+        T = sim_obses.shape[0]
+        N = sim_obses.shape[1]
+        chunk_starts = list(range(0, T - H - F + 1, F))
+        if len(chunk_starts) == 0:
+            return None, []
+
+        all_state_0, all_actions, all_state_gt = [], [], []
+        for t in chunk_starts:
+            all_state_0.append(sim_obses[t:t + H])
+            all_actions.append(sim_actions[t + H - 1:t + H - 1 + F])
+            all_state_gt.append(sim_obses[t + H:t + H + F])
+
+        K = len(chunk_starts)
+        state_0 = torch.stack(all_state_0).permute(0, 2, 1, 3).reshape(K * N, H, -1)
+        future_actions = torch.stack(all_actions).permute(0, 2, 1, 3).reshape(K * N, F, -1)
+        state_gt = torch.stack(all_state_gt).permute(0, 2, 1, 3).reshape(K * N, F, -1)
+
+        data = {"state_0": state_0, "actions": future_actions, "state_gt": state_gt}
+        scores = self.scorer.score(data, mode="mse").reshape(K, N)
+        return scores, chunk_starts
+
+    def paint_weights(self, scores, chunk_starts, T, N):
+        """Build (T, N) per-timestep weights from per-chunk scores.
+
+        Timesteps not covered by any chunk's future window stay at 1.0
+        (caller is responsible for filling the real-env complement).
+        """
+        sim_w = torch.ones(T, N, device=self.device)
+        if scores is None:
+            return sim_w
+        chunk_weight = self._chunk_weight_fn()(scores)
+        F = self.future_horizon
+        H = self.horizon
+        for i, t in enumerate(chunk_starts):
+            sim_w[t + H:t + H + F] = chunk_weight[i].unsqueeze(0).expand(F, -1)
+        return sim_w
+
+    def _chunk_weight_fn(self):
+        if self.scoring_mode == "binary":
+            return self._chunk_weight_binary
+        if self.scoring_mode == "softmax":
+            return self._chunk_weight_softmax
+        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
+
+    def _chunk_weight_binary(self, scores):
+        return (scores <= self.threshold).float()
+
+    def _chunk_weight_softmax(self, scores):
+        return torch.exp(-scores / self.temperature)
+
+    def sample_idx(self, flat_weights, total):
+        """Return a (total,) LongTensor index into flat_weights, or None for
+        no-op (all weights == 1.0 in binary mode, or zero total weight)."""
+        if self.scoring_mode == "binary":
+            return self._sample_idx_binary(flat_weights, total)
+        if self.scoring_mode == "softmax":
+            return self._sample_idx_softmax(flat_weights, total)
+        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
+
+    def _sample_idx_binary(self, flat_w, total):
+        accepted_idx = flat_w.nonzero(as_tuple=True)[0]
+        if accepted_idx.numel() == 0:
+            return None
+        if accepted_idx.numel() == total:
+            return None
+        return accepted_idx[torch.randint(0, accepted_idx.numel(), (total,), device=self.device)]
+
+    def _sample_idx_softmax(self, flat_w, total):
+        if flat_w.sum() <= 0:
+            return None
+        return torch.multinomial(flat_w, total, replacement=True)
+
+    def log_stats(self, weights, writer, step):
+        """Write per-mode scalars to tensorboard. weights is (T, N) sim-only."""
+        if writer is None:
+            return
+        if self.scoring_mode == "binary":
+            writer.add_scalar(
+                "cotrain/sim_accept_rate", weights.float().mean().item(), step,
+            )
+        elif self.scoring_mode == "softmax":
+            w_flat = weights.reshape(-1)
+            total = w_flat.numel()
+            ess = (w_flat.sum() ** 2) / (w_flat.pow(2).sum().clamp_min(1e-12))
+            writer.add_scalar("cotrain/sim_weight_mean", w_flat.mean().item(), step)
+            writer.add_scalar("cotrain/sim_weight_ess_norm", (ess / total).item(), step)
+
+
 class CotrainExperienceBuffer:
     """PPO experience buffer for sim-real co-training with dynamics scoring.
 
@@ -94,22 +235,23 @@ class CotrainExperienceBuffer:
         self.plot_num_trajectories = max(1, int(plot_num_trajectories))
 
         if scorer is not None:
-            assert threshold is not None, "threshold is required when scorer is provided"
             assert sim_env_idx is not None, "sim_env_idx is required when scorer is provided"
             assert sim_env_idx.dim() == 1, (
                 f"sim_env_idx must be 1-D, got shape {tuple(sim_env_idx.shape)}"
             )
-            if scoring_mode == "softmax":
-                assert temperature is not None and float(temperature) > 0, (
-                    "temperature > 0 is required when scoring_mode='softmax'"
-                )
+            self._chunk_scorer = ChunkScorer(
+                scorer=scorer, threshold=threshold,
+                scoring_mode=scoring_mode, temperature=temperature, device=device,
+            )
+            # Back-compat aliases used by plotting code paths below.
             self.scorer = scorer
-            self.threshold = float(threshold)
-            self.temperature = float(temperature) if temperature is not None else None
-            self._horizon = scorer.algo.horizon
-            self._future_horizon = scorer.algo.future_horizon
+            self.threshold = self._chunk_scorer.threshold
+            self.temperature = self._chunk_scorer.temperature
+            self._horizon = self._chunk_scorer.horizon
+            self._future_horizon = self._chunk_scorer.future_horizon
             self.sim_env_idx = sim_env_idx.to(self.device).long()
         else:
+            self._chunk_scorer = None
             self.scorer = None
             self.threshold = None
             self.temperature = None
@@ -188,94 +330,42 @@ class CotrainExperienceBuffer:
         T: int,
         num_envs: int,
     ) -> torch.Tensor:
-        """Build (T, num_envs) non-negative sampling weights from precomputed
-        per-chunk MSE scores. Real envs (complement of sim_env_idx) and
-        sim-env timesteps outside any scored chunk window always receive
-        weight 1.0. Scored sim chunks get their per-mode weight from
-        `_chunk_weight_<mode>`.
-        """
         weights = torch.ones(T, num_envs, device=self.device)
         num_sim = int(self.sim_env_idx.numel())
         if num_sim == 0 or scores is None:
             return weights
-
-        chunk_weight = self._chunk_weight_fn()(scores)                  # (K, N_sim)
-        sim_w = self._paint_chunk_weights_onto_timesteps(
-            chunk_weight, chunk_starts, T, num_sim,
-        )
+        sim_w = self._chunk_scorer.paint_weights(scores, chunk_starts, T, num_sim)
         weights[:, self.sim_env_idx] = sim_w
         return weights
 
-    def _chunk_weight_fn(self):
-        """Dispatch to the per-mode chunk-weight function."""
-        if self.scoring_mode == "binary":
-            return self._chunk_weight_binary
-        if self.scoring_mode == "softmax":
-            return self._chunk_weight_softmax
-        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
+    def _score_sim_chunks(self, td: dict, T: int):
+        """Extract sim-env chunks, run the scorer, return (scores, chunk_starts)."""
+        sim_obses = td["obses"].index_select(1, self.sim_env_idx)
+        actions   = td["actions"].index_select(1, self.sim_env_idx)
+        return self._chunk_scorer.score_chunks(sim_obses, actions)
 
+    # Delegation shims — keep these on CotrainExperienceBuffer so existing
+    # tests and call-sites that access them directly continue to work.
     def _chunk_weight_binary(self, scores: torch.Tensor) -> torch.Tensor:
-        """Hard accept/reject: 1 where score ≤ threshold, 0 otherwise."""
-        return (scores <= self.threshold).float()
+        return self._chunk_scorer._chunk_weight_binary(scores)
 
     def _chunk_weight_softmax(self, scores: torch.Tensor) -> torch.Tensor:
-        """Soft weights ∝ exp(-score / τ). In (0, 1] with max at score=0."""
-        return torch.exp(-scores / self.temperature)
+        return self._chunk_scorer._chunk_weight_softmax(scores)
 
-    def _score_sim_chunks(self, td: dict, T: int):
-        """Extract sim-env chunks, run the scorer, return (scores, chunk_starts).
+    def _sample_idx_binary(self, flat_w: torch.Tensor, total: int) -> Optional[torch.Tensor]:
+        return self._chunk_scorer._sample_idx_binary(flat_w, total)
 
-        Returns `(None, [])` when the rollout is too short for any valid chunk.
-        """
-        H = self._horizon
-        F = self._future_horizon
-        chunk_starts = list(range(0, T - H - F + 1, F))
-        if len(chunk_starts) == 0:
-            return None, []
-
-        num_sim = int(self.sim_env_idx.numel())
-        sim_obses = td["obses"].index_select(1, self.sim_env_idx)    # (T, N_sim, D_s)
-        actions = td["actions"].index_select(1, self.sim_env_idx)    # (T, N_sim, D_a)
-
-        all_state_0, all_actions, all_state_gt = [], [], []
-        for t in chunk_starts:
-            all_state_0.append(sim_obses[t:t + H])
-            all_actions.append(actions[t + H - 1:t + H - 1 + F])
-            all_state_gt.append(sim_obses[t + H:t + H + F])
-
-        K = len(chunk_starts)
-        state_0 = torch.stack(all_state_0).permute(0, 2, 1, 3).reshape(K * num_sim, H, -1)
-        future_actions = torch.stack(all_actions).permute(0, 2, 1, 3).reshape(K * num_sim, F, -1)
-        state_gt = torch.stack(all_state_gt).permute(0, 2, 1, 3).reshape(K * num_sim, F, -1)
-
-        data = {"state_0": state_0, "actions": future_actions, "state_gt": state_gt}
-        scores = self.scorer.score(data, mode="mse").reshape(K, num_sim)
-        return scores, chunk_starts
-
-    def _paint_chunk_weights_onto_timesteps(
-        self, chunk_weight: torch.Tensor, chunk_starts, T: int, num_sim: int,
-    ) -> torch.Tensor:
-        """Expand (K, N_sim) per-chunk weights onto a (T, N_sim) per-timestep
-        tensor. Timesteps not covered by any chunk's future window stay at 1.0."""
-        sim_w = torch.ones(T, num_sim, device=self.device)
-        F = self._future_horizon
-        H = self._horizon
-        for i, t in enumerate(chunk_starts):
-            sim_w[t + H:t + H + F] = chunk_weight[i].unsqueeze(0).expand(F, -1)
-        return sim_w
+    def _sample_idx_softmax(self, flat_w: torch.Tensor, total: int) -> Optional[torch.Tensor]:
+        return self._chunk_scorer._sample_idx_softmax(flat_w, total)
 
     # ------------------------------------------------------------------
     # Sampling (one method per mode, dispatched by scoring_mode)
     # ------------------------------------------------------------------
 
     def _apply_resample(self, td: dict, weights: torch.Tensor, T: int, num_envs: int):
-        """Draw sample_idx via the per-mode sampler and shuffle every field in
-        `td` shaped (T, num_envs, *) by the SAME indices. Sharing sample_idx
-        across fields preserves row-wise relationships (e.g. returns - values
-        -> advantages) post-resample."""
         flat_w = weights.reshape(-1)
         total = T * num_envs
-        sample_idx = self._sample_idx_fn()(flat_w, total)
+        sample_idx = self._chunk_scorer.sample_idx(flat_w, total)
         if sample_idx is None:
             return
         for key, val in td.items():
@@ -285,31 +375,6 @@ class CotrainExperienceBuffer:
                 continue
             flat_shape = (total, *val.shape[2:])
             td[key] = val.reshape(flat_shape)[sample_idx].reshape(val.shape)
-
-    def _sample_idx_fn(self):
-        """Dispatch to the per-mode sample-index function."""
-        if self.scoring_mode == "binary":
-            return self._sample_idx_binary
-        if self.scoring_mode == "softmax":
-            return self._sample_idx_softmax
-        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
-
-    def _sample_idx_binary(self, flat_w: torch.Tensor, total: int) -> Optional[torch.Tensor]:
-        """Uniform sample (with replacement) over cells with weight > 0.
-        Returns None when every cell is accepted (no-op) or nothing is (degenerate)."""
-        accepted_idx = flat_w.nonzero(as_tuple=True)[0]
-        if accepted_idx.numel() == 0:
-            return None
-        if accepted_idx.numel() == total:
-            return None
-        return accepted_idx[torch.randint(0, accepted_idx.numel(), (total,), device=self.device)]
-
-    def _sample_idx_softmax(self, flat_w: torch.Tensor, total: int) -> Optional[torch.Tensor]:
-        """Multinomial sample (with replacement) proportional to flat_w.
-        torch.multinomial normalizes internally; weights need not sum to 1."""
-        if flat_w.sum() <= 0:
-            return None
-        return torch.multinomial(flat_w, total, replacement=True)
 
     # ------------------------------------------------------------------
     # Logging (per-mode stats)
@@ -322,26 +387,7 @@ class CotrainExperienceBuffer:
         if self.writer is None:
             return
         sim_w = weights.index_select(1, self.sim_env_idx)
-        if self.scoring_mode == "binary":
-            self._log_stats_binary(sim_w)
-        elif self.scoring_mode == "softmax":
-            self._log_stats_softmax(sim_w)
-
-    def _log_stats_binary(self, sim_w: torch.Tensor) -> None:
-        self.writer.add_scalar(
-            "cotrain/sim_accept_rate", sim_w.float().mean().item(), self._log_step,
-        )
-
-    def _log_stats_softmax(self, sim_w: torch.Tensor) -> None:
-        w_flat = sim_w.reshape(-1)
-        total = w_flat.numel()
-        ess = (w_flat.sum() ** 2) / (w_flat.pow(2).sum().clamp_min(1e-12))
-        self.writer.add_scalar(
-            "cotrain/sim_weight_mean", w_flat.mean().item(), self._log_step,
-        )
-        self.writer.add_scalar(
-            "cotrain/sim_weight_ess_norm", (ess / total).item(), self._log_step,
-        )
+        self._chunk_scorer.log_stats(sim_w, self.writer, self._log_step)
 
     # ------------------------------------------------------------------
     # Diagnostic plotting (per-resample distribution-shift monitor)

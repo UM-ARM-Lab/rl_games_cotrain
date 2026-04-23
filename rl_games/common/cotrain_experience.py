@@ -169,7 +169,10 @@ class CotrainExperienceBuffer:
         )
 
         self._log_scoring_stats(weights)
-        self._maybe_save_resample_plot(td, scores, chunk_starts)
+        # self._maybe_save_resample_plot(td, scores, chunk_starts)
+        if scores is not None and self.threshold is not None:
+            accept_ratio = (scores < self.threshold).float().mean().item()
+            print(f"[Cotrain] sim acceptance ratio (score<thr): {accept_ratio:.4f}")
         self._apply_resample(td, weights, T, num_envs)
 
         return rnn_states_raw

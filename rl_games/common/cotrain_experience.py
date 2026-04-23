@@ -99,19 +99,17 @@ class ChunkScorer:
         sim_w = torch.ones(T, N, device=self.device)
         if scores is None:
             return sim_w
-        chunk_weight = self._chunk_weight_fn()(scores)
+        if self.scoring_mode == "binary":
+            chunk_weight = self._chunk_weight_binary(scores)
+        elif self.scoring_mode == "softmax":
+            chunk_weight = self._chunk_weight_softmax(scores)
+        else:
+            raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
         F = self.future_horizon
         H = self.horizon
         for i, t in enumerate(chunk_starts):
             sim_w[t + H:t + H + F] = chunk_weight[i].unsqueeze(0).expand(F, -1)
         return sim_w
-
-    def _chunk_weight_fn(self):
-        if self.scoring_mode == "binary":
-            return self._chunk_weight_binary
-        if self.scoring_mode == "softmax":
-            return self._chunk_weight_softmax
-        raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
 
     def _chunk_weight_binary(self, scores):
         return (scores <= self.threshold).float()
@@ -155,6 +153,8 @@ class ChunkScorer:
             ess = (w_flat.sum() ** 2) / (w_flat.pow(2).sum().clamp_min(1e-12))
             writer.add_scalar("cotrain/sim_weight_mean", w_flat.mean().item(), step)
             writer.add_scalar("cotrain/sim_weight_ess_norm", (ess / total).item(), step)
+        else:
+            raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
 
 
 class CotrainExperienceBuffer:
@@ -170,8 +170,6 @@ class CotrainExperienceBuffer:
     are all provided; when any is None, the buffer behaves as a plain
     pass-through ExperienceBuffer.
     """
-
-    SCORING_MODES = ("binary", "softmax")
 
     def __init__(
         self,
@@ -225,9 +223,6 @@ class CotrainExperienceBuffer:
         self.writer = writer
         self._log_step = 0
 
-        assert scoring_mode in self.SCORING_MODES, (
-            f"scoring_mode must be one of {self.SCORING_MODES}, got {scoring_mode!r}"
-        )
         self.scoring_mode = scoring_mode
 
         self.plot_dir = plot_dir
@@ -330,6 +325,11 @@ class CotrainExperienceBuffer:
         T: int,
         num_envs: int,
     ) -> torch.Tensor:
+        """Build (T, num_envs) non-negative sampling weights from precomputed
+        per-chunk MSE scores. Real envs (complement of sim_env_idx) and
+        sim-env timesteps outside any scored chunk window always receive
+        weight 1.0. Scored sim chunks get their per-mode weight from
+        the shared ChunkScorer.paint_weights helper."""
         weights = torch.ones(T, num_envs, device=self.device)
         num_sim = int(self.sim_env_idx.numel())
         if num_sim == 0 or scores is None:
@@ -363,6 +363,10 @@ class CotrainExperienceBuffer:
     # ------------------------------------------------------------------
 
     def _apply_resample(self, td: dict, weights: torch.Tensor, T: int, num_envs: int):
+        """Draw sample_idx via the per-mode sampler and shuffle every field in
+        `td` shaped (T, num_envs, *) by the SAME indices. Sharing sample_idx
+        across fields preserves row-wise relationships (e.g. returns - values
+        -> advantages) post-resample."""
         flat_w = weights.reshape(-1)
         total = T * num_envs
         sample_idx = self._chunk_scorer.sample_idx(flat_w, total)

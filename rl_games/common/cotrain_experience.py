@@ -654,12 +654,6 @@ class CotrainVectorizedReplayBuffer:
             if sim_cap > 0 and num_train_sim > 0 else None
         )
 
-        # Zero-initialize obs tensors so unwritten regions are identifiably empty.
-        if self._real_buf is not None:
-            self._real_buf.obses.zero_()
-        if self._sim_buf is not None:
-            self._sim_buf.obses.zero_()
-
         # Per-slot sampling weight; parallel to self._sim_buf data tensors.
         # Owned by this wrapper, not monkey-patched onto VectorizedReplayBuffer.
         self._sim_weights = (

@@ -120,6 +120,11 @@ class SACAgent(BaseAlgorithm):
                 f"cotrain.num_train_real ({num_train_real}) + cotrain.num_train_sim "
                 f"({num_train_sim}) must equal num_train_envs ({self.num_train_envs})"
             )
+            if cotrain_cfg.get("train_scorer", False):
+                raise NotImplementedError(
+                    "train_scorer=True not supported under chunk-scoring; "
+                    "tracked as a follow-up. Set cotrain.train_scorer=false."
+                )
             self.replay_buffer = CotrainVectorizedReplayBuffer(
                 obs_shape=self.env_info["observation_space"].shape,
                 action_shape=self.env_info["action_space"].shape,
@@ -129,8 +134,13 @@ class SACAgent(BaseAlgorithm):
                 num_train_sim=num_train_sim,
                 num_total_envs=self.num_actors,
                 real_data_ratio=cotrain_cfg.get("real_data_ratio", 0.3),
-                traj_resampler=cotrain_cfg.get("scorer_object", None),
-                train_scorer=cotrain_cfg.get("train_scorer", False),
+                scorer=cotrain_cfg.get("scorer_object", None),
+                threshold=cotrain_cfg.get("scorer_threshold", None),
+                scoring_mode=cotrain_cfg.get("scoring_mode", "binary"),
+                temperature=cotrain_cfg.get("temperature", None),
+                plot_dir=cotrain_cfg.get("plot_dir", None),
+                plot_every=cotrain_cfg.get("plot_every", 1),
+                plot_num_trajectories=cotrain_cfg.get("plot_num_trajectories", 10),
                 writer=self.writer,
             )
 

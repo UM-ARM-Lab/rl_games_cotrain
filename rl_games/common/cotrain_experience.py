@@ -32,21 +32,31 @@ class ChunkScorer:
     """
 
     SCORING_MODES = ("binary", "softmax")
+    SCORE_DIRECTIONS = ("le", "ge")
 
-    def __init__(self, scorer, threshold, scoring_mode, temperature, device):
+    def __init__(self, scorer, threshold, scoring_mode, temperature, device, score_direction="le"):
         assert scorer is not None
         assert threshold is not None, "threshold required when scoring is enabled"
         assert scoring_mode in self.SCORING_MODES, (
             f"scoring_mode must be one of {self.SCORING_MODES}, got {scoring_mode!r}"
         )
+        assert score_direction in self.SCORE_DIRECTIONS, (
+            f"score_direction must be one of {self.SCORE_DIRECTIONS}, got {score_direction!r}"
+        )
         if scoring_mode == "softmax":
             assert temperature is not None and float(temperature) > 0, (
                 "temperature > 0 is required when scoring_mode='softmax'"
+            )
+            assert score_direction == "le", (
+                "softmax mode currently only supports score_direction='le' (lower-is-better) — "
+                "the exp(-score / temp) weighting assumes that convention. "
+                "Use scoring_mode='binary' for higher-is-better scorers (e.g. SDFScorer)."
             )
         self.scorer = scorer
         self.threshold = float(threshold)
         self.scoring_mode = scoring_mode
         self.temperature = float(temperature) if temperature is not None else None
+        self.score_direction = score_direction
         self.device = device
 
     @property
@@ -112,7 +122,10 @@ class ChunkScorer:
         return sim_w
 
     def _chunk_weight_binary(self, scores):
-        return (scores <= self.threshold).float()
+        if self.score_direction == "le":
+            return (scores <= self.threshold).float()
+        # "ge": higher-is-better (e.g. raw SDF). Accept when score >= threshold.
+        return (scores >= self.threshold).float()
 
     def _chunk_weight_softmax(self, scores):
         return torch.exp(-scores / self.temperature)
@@ -181,6 +194,7 @@ class CotrainExperienceBuffer:
         sim_env_idx: Optional[torch.Tensor] = None,
         scoring_mode: str = "binary",
         temperature: Optional[float] = None,
+        score_direction: str = "le",
         plot_dir: Optional[str] = None,
         plot_every: int = 1,
         plot_num_trajectories: int = 10,
@@ -236,12 +250,14 @@ class CotrainExperienceBuffer:
             )
             self._chunk_scorer = ChunkScorer(
                 scorer=scorer, threshold=threshold,
-                scoring_mode=scoring_mode, temperature=temperature, device=device,
+                scoring_mode=scoring_mode, temperature=temperature,
+                score_direction=score_direction, device=device,
             )
             # Back-compat aliases used by plotting code paths below.
             self.scorer = scorer
             self.threshold = self._chunk_scorer.threshold
             self.temperature = self._chunk_scorer.temperature
+            self.score_direction = self._chunk_scorer.score_direction
             self._horizon = self._chunk_scorer.horizon
             self._future_horizon = self._chunk_scorer.future_horizon
             self.sim_env_idx = sim_env_idx.to(self.device).long()
@@ -250,6 +266,7 @@ class CotrainExperienceBuffer:
             self.scorer = None
             self.threshold = None
             self.temperature = None
+            self.score_direction = None
             self._horizon = None
             self._future_horizon = None
             self.sim_env_idx = None
@@ -308,8 +325,14 @@ class CotrainExperienceBuffer:
         self._log_scoring_stats(weights)
         # self._maybe_save_resample_plot(td, scores, chunk_starts)
         if scores is not None and self.threshold is not None:
-            accept_ratio = (scores < self.threshold).float().mean().item()
-            print(f"[Cotrain] sim acceptance ratio (score<thr): {accept_ratio:.4f}")
+            if self.score_direction == "le":
+                accept_mask = scores <= self.threshold
+                cmp_str = "score<=thr"
+            else:
+                accept_mask = scores >= self.threshold
+                cmp_str = "score>=thr"
+            accept_ratio = accept_mask.float().mean().item()
+            print(f"[Cotrain] sim acceptance ratio ({cmp_str}): {accept_ratio:.4f}")
         self._apply_resample(td, weights, T, num_envs)
 
         return rnn_states_raw
@@ -614,6 +637,7 @@ class CotrainVectorizedReplayBuffer:
         threshold: Optional[float] = None,
         scoring_mode: str = "binary",
         temperature: Optional[float] = None,
+        score_direction: str = "le",
         plot_dir: Optional[str] = None,
         plot_every: int = 1,
         plot_num_trajectories: int = 10,
@@ -667,7 +691,8 @@ class CotrainVectorizedReplayBuffer:
         self._chunk_scorer = (
             ChunkScorer(
                 scorer=scorer, threshold=threshold,
-                scoring_mode=scoring_mode, temperature=temperature, device=device,
+                scoring_mode=scoring_mode, temperature=temperature,
+                score_direction=score_direction, device=device,
             )
             if scorer is not None else None
         )

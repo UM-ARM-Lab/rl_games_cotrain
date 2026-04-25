@@ -138,6 +138,7 @@ class SACAgent(BaseAlgorithm):
                 threshold=cotrain_cfg.get("scorer_threshold", None),
                 scoring_mode=cotrain_cfg.get("scoring_mode", "binary"),
                 temperature=cotrain_cfg.get("temperature", None),
+                score_direction=cotrain_cfg.get("score_direction", "le"),
                 plot_dir=cotrain_cfg.get("plot_dir", None),
                 plot_every=cotrain_cfg.get("plot_every", 1),
                 plot_num_trajectories=cotrain_cfg.get("plot_num_trajectories", 10),

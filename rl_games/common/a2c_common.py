@@ -581,6 +581,8 @@ class A2CBase(BaseAlgorithm):
                 plot_dir=self.cotrain_cfg.get("plot_dir", None),
                 plot_every=self.cotrain_cfg.get("plot_every", 1),
                 plot_num_trajectories=self.cotrain_cfg.get("plot_num_trajectories", 10),
+                mod_method=self.cotrain_cfg.get("mod_method", "filter"),
+                mod_cfg=self.cotrain_cfg.get("mod", None),
                 writer=self.writer,
             )
 
@@ -944,6 +946,12 @@ class A2CBase(BaseAlgorithm):
         mb_values = self.experience_buffer.tensor_dict["values"]
         mb_rewards = self.experience_buffer.tensor_dict["rewards"]
         mb_masks = self.experience_buffer.tensor_dict.get("mask", None)
+
+        # mod_method=rew_low/rew_sub mutates mb_rewards in-place here so GAE
+        # propagates the penalty backward. mod_method=filter is a no-op.
+        if self.cotrain_enabled:
+            self.experience_buffer.apply_pre_gae(self.experience_buffer.tensor_dict)
+
         if mb_masks is not None:
             mb_advs = self.discount_values_masks(
                 fdones, last_values, mb_fdones, mb_values, mb_rewards, mb_masks.float()
@@ -955,7 +963,11 @@ class A2CBase(BaseAlgorithm):
         batch_dict = {}
         if self.cotrain_enabled:
             self.experience_buffer.update_data_full("returns", mb_returns)
-            self.experience_buffer.resample(rnn_states_raw=None, seq_length=self.horizon_length)
+            self.experience_buffer.apply_post_gae(
+                td=self.experience_buffer.tensor_dict,
+                rnn_states_raw=None,
+                seq_length=self.horizon_length,
+            )
             tensor_list_with_return = self.tensor_list + ["returns"]
             batch_dict = self.experience_buffer.get_transformed_list(
                 swap_and_flatten01, tensor_list_with_return
@@ -1062,6 +1074,12 @@ class A2CBase(BaseAlgorithm):
         mb_values = self.experience_buffer.tensor_dict["values"]
         mb_rewards = self.experience_buffer.tensor_dict["rewards"]
         mb_masks = self.experience_buffer.tensor_dict.get("mask", None)
+
+        # mod_method=rew_low/rew_sub mutates mb_rewards in-place here so GAE
+        # propagates the penalty backward. mod_method=filter is a no-op.
+        if self.cotrain_enabled:
+            self.experience_buffer.apply_pre_gae(self.experience_buffer.tensor_dict)
+
         if mb_masks is not None:
             mb_advs = self.discount_values_masks(
                 fdones, last_values, mb_fdones, mb_values, mb_rewards, mb_masks.float()
@@ -1073,7 +1091,8 @@ class A2CBase(BaseAlgorithm):
         batch_dict = {}
         if self.cotrain_enabled:
             self.experience_buffer.update_data_full("returns", mb_returns)
-            resampled_rnn_raw = self.experience_buffer.resample(
+            resampled_rnn_raw = self.experience_buffer.apply_post_gae(
+                td=self.experience_buffer.tensor_dict,
                 rnn_states_raw=mb_rnn_states,
                 seq_length=self.seq_length,
             )

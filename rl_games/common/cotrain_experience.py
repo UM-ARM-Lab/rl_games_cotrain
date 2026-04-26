@@ -11,6 +11,7 @@ is responsible for pulling `idx_train_sim` from the env and forwarding it
 here at construction time.
 """
 
+from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional
 import torch
 from rl_games.common.experience import ExperienceBuffer, VectorizedReplayBuffer
@@ -168,6 +169,56 @@ class ChunkScorer:
             writer.add_scalar("cotrain/sim_weight_ess_norm", (ess / total).item(), step)
         else:
             raise NotImplementedError(f"Unknown scoring_mode={self.scoring_mode!r}")
+
+
+class ScoreConsumer(ABC):
+    """Consumes a per-cell (T, num_envs) weight grid produced by ChunkScorer to
+    mutate an experience-buffer tensor_dict in-place. Each subclass declares
+    its PHASE so the buffer knows which hook (pre-GAE vs post-GAE) to call it from.
+
+    PHASE values:
+        "pre_gae"  — runs before PPO's discount_values() so reward mutations
+                     propagate through GAE.
+        "post_gae" — runs after returns are computed so row permutations
+                     preserve (returns, values, advantages) row-alignment.
+    """
+
+    PHASE: str = ""
+
+    @abstractmethod
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        """Mutate `td` in-place using the (T, num_envs) weight grid.
+
+        Real-env columns and outside-window cells are 1.0 by construction, so
+        consumers never need a sim_env_idx — the weight==0 mask already only
+        fires on rejected scored cells.
+        """
+
+
+class FilterConsumer(ScoreConsumer):
+    """post-GAE: resample buffer rows by sampling from a flat weight vector.
+    Body lifted from CotrainExperienceBuffer._apply_resample."""
+
+    PHASE = "post_gae"
+
+    def __init__(self, chunk_scorer: "ChunkScorer"):
+        self._chunk_scorer = chunk_scorer
+
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        T = weights.shape[0]
+        num_envs = weights.shape[1]
+        flat_w = weights.reshape(-1)
+        total = T * num_envs
+        sample_idx = self._chunk_scorer.sample_idx(flat_w, total)
+        if sample_idx is None:
+            return
+        for key, val in td.items():
+            if not isinstance(val, torch.Tensor):
+                continue
+            if val.shape[0] != T or (val.ndim >= 2 and val.shape[1] != num_envs):
+                continue
+            flat_shape = (total, *val.shape[2:])
+            td[key] = val.reshape(flat_shape)[sample_idx].reshape(val.shape)
 
 
 class CotrainExperienceBuffer:

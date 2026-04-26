@@ -240,6 +240,26 @@ class RewLowConsumer(ScoreConsumer):
         rewards[reject] = self.reward_floor
 
 
+class RewSubConsumer(ScoreConsumer):
+    """pre-GAE: subtract `reward_subtract` from td['rewards'] on cells where
+    weight == 0.0. Sign convention: positive reward_subtract = penalty
+    (rewards go down on rejected cells).
+
+    Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
+    construction.
+    """
+
+    PHASE = "pre_gae"
+
+    def __init__(self, reward_subtract: float):
+        self.reward_subtract = float(reward_subtract)
+
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        rewards = td["rewards"]                                                  # (T, N, value_size)
+        reject = (weights == 0.0).unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
+        rewards.sub_(reject * self.reward_subtract)
+
+
 class CotrainExperienceBuffer:
     """PPO experience buffer for sim-real co-training with dynamics scoring.
 

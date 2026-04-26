@@ -221,6 +221,25 @@ class FilterConsumer(ScoreConsumer):
             td[key] = val.reshape(flat_shape)[sample_idx].reshape(val.shape)
 
 
+class RewLowConsumer(ScoreConsumer):
+    """pre-GAE: floor td['rewards'] on cells where weight == 0.0.
+
+    Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
+    construction. The consumer reads the weight grid as a {0, 1} mask and
+    writes `reward_floor` into rewards wherever weight == 0.
+    """
+
+    PHASE = "pre_gae"
+
+    def __init__(self, reward_floor: float):
+        self.reward_floor = float(reward_floor)
+
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        rewards = td["rewards"]                                          # (T, N, value_size)
+        reject = (weights == 0.0).unsqueeze(-1).expand_as(rewards)        # (T, N, value_size)
+        rewards[reject] = self.reward_floor
+
+
 class CotrainExperienceBuffer:
     """PPO experience buffer for sim-real co-training with dynamics scoring.
 

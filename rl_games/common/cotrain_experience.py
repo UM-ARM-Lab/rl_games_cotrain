@@ -450,20 +450,6 @@ class CotrainExperienceBuffer:
     # Scoring + Resampling
     # ------------------------------------------------------------------
 
-    def resample(
-        self,
-        rnn_states_raw: Optional[List[torch.Tensor]] = None,
-        seq_length: int = 1,
-    ) -> Optional[List[torch.Tensor]]:
-        """Back-compat shim. Delegates to apply_post_gae(). New code should
-        call apply_post_gae() directly; this exists only to keep call sites
-        working during the rename."""
-        return self.apply_post_gae(
-            td=self.buffer.tensor_dict,
-            rnn_states_raw=rnn_states_raw,
-            seq_length=seq_length,
-        )
-
     # ------------------------------------------------------------------
     # mod_method dispatch hooks
     # ------------------------------------------------------------------

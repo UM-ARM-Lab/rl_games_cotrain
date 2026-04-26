@@ -305,6 +305,8 @@ class CotrainExperienceBuffer:
         plot_dir: Optional[str] = None,
         plot_every: int = 1,
         plot_num_trajectories: int = 10,
+        mod_method: str = "filter",
+        mod_cfg: Optional[dict] = None,
         writer=None,
     ):
         """
@@ -337,6 +339,12 @@ class CotrainExperienceBuffer:
                 be set for this to fire.
             plot_num_trajectories: How many random sim envs to render per
                 plot (capped at num_sim_envs).
+            mod_method: How to consume the per-cell weight grid. "filter"
+                (default) resamples buffer rows post-GAE. "rew_low" floors
+                rewards on rejected cells pre-GAE. "rew_sub" subtracts a
+                penalty pre-GAE. "loss_weight" is reserved.
+            mod_cfg: Config dict for the selected mod_method. Required keys
+                vary by method (e.g. "reward_floor" for "rew_low").
             writer: Optional tensorboard SummaryWriter for logging.
         """
         self.buffer = ExperienceBuffer(env_info, algo_info, device)
@@ -349,6 +357,13 @@ class CotrainExperienceBuffer:
         self.plot_dir = plot_dir
         self.plot_every = max(1, int(plot_every))
         self.plot_num_trajectories = max(1, int(plot_num_trajectories))
+
+        # Validate mod_method / scoring_mode compatibility early — before
+        # ChunkScorer is constructed — so the assertion message is actionable.
+        if mod_method in ("rew_low", "rew_sub"):
+            assert scoring_mode == "binary", (
+                f"mod_method={mod_method!r} requires scoring_mode='binary', got {scoring_mode!r}"
+            )
 
         if scorer is not None:
             assert sim_env_idx is not None, "sim_env_idx is required when scorer is provided"
@@ -378,6 +393,42 @@ class CotrainExperienceBuffer:
             self._future_horizon = None
             self.sim_env_idx = None
 
+        # ---- mod_method consumer ----------------------------------------------
+        # Selects what to do with the per-cell weight grid produced above.
+        # `filter` (default) reproduces today's resample-by-weight behavior.
+        # `rew_low` / `rew_sub` overwrite/penalize td['rewards'] on weight==0
+        # cells (binary scoring only). `loss_weight` is reserved.
+        self.mod_method = mod_method
+        self.mod_cfg = dict(mod_cfg) if mod_cfg else {}
+
+        if not self.scoring_enabled:
+            self._consumer = None
+        elif mod_method == "filter":
+            self._consumer = FilterConsumer(self._chunk_scorer)
+        elif mod_method == "rew_low":
+            assert scoring_mode == "binary", (
+                f"mod_method='rew_low' requires scoring_mode='binary', got {scoring_mode!r}"
+            )
+            assert "reward_floor" in self.mod_cfg, (
+                "mod_method='rew_low' requires mod_cfg['reward_floor']"
+            )
+            self._consumer = RewLowConsumer(reward_floor=self.mod_cfg["reward_floor"])
+        elif mod_method == "rew_sub":
+            assert scoring_mode == "binary", (
+                f"mod_method='rew_sub' requires scoring_mode='binary', got {scoring_mode!r}"
+            )
+            assert "reward_subtract" in self.mod_cfg, (
+                "mod_method='rew_sub' requires mod_cfg['reward_subtract']"
+            )
+            self._consumer = RewSubConsumer(reward_subtract=self.mod_cfg["reward_subtract"])
+        elif mod_method == "loss_weight":
+            self._consumer = LossWeightConsumer()  # raises NotImplementedError
+        else:
+            raise ValueError(
+                f"unknown mod_method={mod_method!r}; "
+                f"expected one of 'filter', 'rew_low', 'rew_sub', 'loss_weight'"
+            )
+
     @property
     def scoring_enabled(self) -> bool:
         return self.scorer is not None
@@ -404,45 +455,94 @@ class CotrainExperienceBuffer:
         rnn_states_raw: Optional[List[torch.Tensor]] = None,
         seq_length: int = 1,
     ) -> Optional[List[torch.Tensor]]:
-        """Score sim-env segments and resample the buffer.
+        """Back-compat shim. Delegates to apply_post_gae(). New code should
+        call apply_post_gae() directly; this exists only to keep call sites
+        working during the rename."""
+        return self.apply_post_gae(
+            td=self.buffer.tensor_dict,
+            rnn_states_raw=rnn_states_raw,
+            seq_length=seq_length,
+        )
 
-        When scoring is disabled, this is a no-op (buffer unchanged).
+    # ------------------------------------------------------------------
+    # mod_method dispatch hooks
+    # ------------------------------------------------------------------
 
-        Args:
-            rnn_states_raw: Not used for scoring -- passed through unchanged.
-                RNN resampling is not yet supported with dynamics scoring.
-            seq_length: Not used -- kept for API compat with play_steps_rnn.
+    def apply_pre_gae(self, td: dict) -> None:
+        """Hook invoked by a2c_common BEFORE discount_values(). No-op unless
+        the configured ScoreConsumer's PHASE is 'pre_gae' (i.e. rew_low/rew_sub).
 
-        Returns:
-            rnn_states_raw unchanged (RNN resampling not yet implemented).
+        Mutates td['rewards'] in-place when active, so subsequent GAE sees the
+        modified rewards.
         """
-        if not self.scoring_enabled:
-            return rnn_states_raw
+        if not self.scoring_enabled or self._consumer is None:
+            return
+        if self._consumer.PHASE != "pre_gae":
+            return
+        scores, chunk_starts, weights = self._score_and_paint(td)
+        if weights is None:
+            return
+        self._consumer.apply(td, weights)
+        self._print_acceptance_ratio(scores)
+        self._log_scoring_stats(weights)
+        # self._maybe_save_resample_plot(td, scores, chunk_starts)
 
-        td = self.buffer.tensor_dict
+    def apply_post_gae(
+        self,
+        td: Optional[dict] = None,
+        rnn_states_raw: Optional[List[torch.Tensor]] = None,
+        seq_length: int = 1,
+    ) -> Optional[List[torch.Tensor]]:
+        """Hook invoked by a2c_common AFTER discount_values() + returns are
+        written. No-op unless the configured ScoreConsumer's PHASE is
+        'post_gae' (i.e. filter).
+
+        For backward compatibility with the existing resample() call sites,
+        if `td` is None it falls back to self.buffer.tensor_dict.
+        """
+        if not self.scoring_enabled or self._consumer is None:
+            return rnn_states_raw
+        if self._consumer.PHASE != "post_gae":
+            return rnn_states_raw
+        if td is None:
+            td = self.buffer.tensor_dict
+        scores, chunk_starts, weights = self._score_and_paint(td)
+        if weights is None:
+            return rnn_states_raw
+        self._consumer.apply(td, weights)
+        self._print_acceptance_ratio(scores)
+        self._log_scoring_stats(weights)
+        # self._maybe_save_resample_plot(td, scores, chunk_starts)
+        return rnn_states_raw
+
+    def _print_acceptance_ratio(self, scores: torch.Tensor) -> None:
+        """Per-rollout console print preserved from the legacy resample()."""
+        if scores is None or self.threshold is None:
+            return
+        if self.score_direction == "le":
+            accept_mask = scores <= self.threshold
+            cmp_str = "score<=thr"
+        else:
+            accept_mask = scores >= self.threshold
+            cmp_str = "score>=thr"
+        accept_ratio = accept_mask.float().mean().item()
+        print(f"[Cotrain] sim acceptance ratio ({cmp_str}): {accept_ratio:.4f}")
+
+    def _score_and_paint(self, td: dict):
+        """Score sim chunks and paint full (T, num_envs) weight grid.
+
+        Returns (scores, chunk_starts, weights). Returns (None, [], None)
+        when T is too short for any valid chunk.
+        """
         T = td["dones"].shape[0]
         num_envs = td["dones"].shape[1]
-
-        # Score once; reuse for weight construction AND diagnostic plotting.
         scores, chunk_starts = self._score_sim_chunks(td, T)
+        if scores is None:
+            return None, [], None
         weights = self._build_scoring_weights_from_scores(
             scores, chunk_starts, T, num_envs,
         )
-
-        self._log_scoring_stats(weights)
-        # self._maybe_save_resample_plot(td, scores, chunk_starts)
-        if scores is not None and self.threshold is not None:
-            if self.score_direction == "le":
-                accept_mask = scores <= self.threshold
-                cmp_str = "score<=thr"
-            else:
-                accept_mask = scores >= self.threshold
-                cmp_str = "score>=thr"
-            accept_ratio = accept_mask.float().mean().item()
-            print(f"[Cotrain] sim acceptance ratio ({cmp_str}): {accept_ratio:.4f}")
-        self._apply_resample(td, weights, T, num_envs)
-
-        return rnn_states_raw
+        return scores, chunk_starts, weights
 
     # ------------------------------------------------------------------
     # Weight construction (one method per mode, dispatched by scoring_mode)

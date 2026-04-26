@@ -260,6 +260,23 @@ class RewSubConsumer(ScoreConsumer):
         rewards.sub_(reject * self.reward_subtract)
 
 
+class LossWeightConsumer(ScoreConsumer):
+    """Reserved for a follow-up. Will pass per-cell weights into the PPO
+    surrogate / value loss directly. Spec section 'Open Questions' in
+    docs/superpowers/specs/2026-04-26-reward-modifying-scorer-design.md.
+    """
+
+    PHASE = "post_gae"  # placeholder; revisit in implementation
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "mod_method='loss_weight' is reserved for a follow-up — not yet implemented."
+        )
+
+    def apply(self, td, weights):  # pragma: no cover
+        raise NotImplementedError
+
+
 class CotrainExperienceBuffer:
     """PPO experience buffer for sim-real co-training with dynamics scoring.
 

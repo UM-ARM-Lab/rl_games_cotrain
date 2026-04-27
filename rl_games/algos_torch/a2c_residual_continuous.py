@@ -87,6 +87,9 @@ class A2CResidualAgent(A2CAgent):
             mixed_precision=rcfg.get("mixed_precision", False),
         )
         self.n_real_steps_seen = 0
+        # Populated by prepare_dataset (called inside base train_epoch). The
+        # train_epoch override below reads it after delegating to base.
+        self._last_dataset = None
 
     def _infer_obs_dim(self) -> int:
         shape = getattr(self, "obs_shape", None)
@@ -485,6 +488,52 @@ class A2CResidualAgent(A2CAgent):
 
         # MOD #4: stash for the residual training step in train_epoch (Task 8).
         self._last_dataset = dataset_dict
+
+    def train_epoch(self):
+        """Refresh snapshot → run base train_epoch → train residual on real-only batch.
+
+        Base train_epoch internally calls play_steps, prepare_dataset, and
+        the PPO inner loop. We delegate to it (no copy of the inner-loop
+        body) and slot residual training in afterward.
+        """
+        self.residual_value_net.refresh_snapshot()
+        result = A2CAgent.train_epoch(self)
+
+        ds = self._last_dataset
+        assert ds is not None, "train_epoch called before prepare_dataset has run"
+        is_real = ds["is_real"].bool()
+        if is_real.any():
+            # Match the rollout-time obs space: residual head saw normalized
+            # obs in get_action_values, so training input must also be
+            # normalized obs to keep the input distribution consistent.
+            obs_real = self._normalize_obs(ds["obs"][is_real])
+            v_sim_real = ds["values_sim"][is_real]
+            with torch.no_grad():
+                v_sim_norm_real = (
+                    self.value_mean_std(v_sim_real) if self.normalize_value else v_sim_real
+                )
+            target_real = ds["target_resid_norm"][is_real]
+            stats = self.residual_value_net.train_net(
+                obs_real=obs_real,
+                v_sim_real=v_sim_norm_real,
+                target_real=target_real,
+                minibatch_size=self.minibatch_size,
+            )
+            self._log_residual_stats(stats)
+        return result
+
+    def _log_residual_stats(self, stats: dict) -> None:
+        if not hasattr(self, "writer") or self.writer is None:
+            return
+        self.writer.add_scalar("residual/loss", stats["residual_loss"], self.frame)
+        self.writer.add_scalar("residual/mean_abs", stats["residual_mean_abs"], self.frame)
+        self.writer.add_scalar("residual/n_real_samples", stats["n_real_samples"], self.frame)
+        self.writer.add_scalar("residual/alpha", self.current_alpha(), self.frame)
+        if stats["residual_mean_abs"] > 0.1:
+            print(
+                f"[residual] WARN: mean|V_residual|={stats['residual_mean_abs']:.4f} "
+                f"exceeds 0.1 — sigma-only fusion presumes mean-zero."
+            )
 
 
 def apply_value_bootstrap_split(

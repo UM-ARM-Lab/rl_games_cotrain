@@ -455,12 +455,21 @@ class CotrainExperienceBuffer:
                 "mod_method='rew_sub' requires mod_cfg['reward_subtract']"
             )
             self._consumer = RewSubConsumer(reward_subtract=self.mod_cfg["reward_subtract"])
+        elif mod_method == "rew_scale":
+            assert scoring_mode == "softmax", (
+                f"mod_method='rew_scale' requires scoring_mode='softmax' "
+                f"(use rew_low for the binary case), got {scoring_mode!r}"
+            )
+            assert "reward_floor" in self.mod_cfg, (
+                "mod_method='rew_scale' requires mod_cfg['reward_floor']"
+            )
+            self._consumer = RewScaleConsumer(reward_floor=self.mod_cfg["reward_floor"])
         elif mod_method == "loss_weight":
             self._consumer = LossWeightConsumer()  # raises NotImplementedError
         else:
             raise ValueError(
                 f"unknown mod_method={mod_method!r}; "
-                f"expected one of 'filter', 'rew_low', 'rew_sub', 'loss_weight'"
+                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_scale', 'loss_weight'"
             )
 
     @property

@@ -519,16 +519,24 @@ class A2CResidualAgent(A2CAgent):
                 target_real=target_real,
                 minibatch_size=self.minibatch_size,
             )
-            self._log_residual_stats(stats)
+        else:
+            # No real data this rollout — log zero-sample marker so the alpha
+            # curve has no gaps and misconfiguration (e.g., empty real_env_idx)
+            # is visible in TensorBoard.
+            stats = {"residual_loss": 0.0, "residual_mean_abs": 0.0, "n_real_samples": 0}
+        self._log_residual_stats(stats)
         return result
 
     def _log_residual_stats(self, stats: dict) -> None:
         if not hasattr(self, "writer") or self.writer is None:
             return
-        self.writer.add_scalar("residual/loss", stats["residual_loss"], self.frame)
-        self.writer.add_scalar("residual/mean_abs", stats["residual_mean_abs"], self.frame)
-        self.writer.add_scalar("residual/n_real_samples", stats["n_real_samples"], self.frame)
-        self.writer.add_scalar("residual/alpha", self.current_alpha(), self.frame)
+        # Match write_stats' post-increment frame so residual/* and losses/*
+        # scalars line up at the same TB step for the same iteration.
+        frame = self.frame + self.curr_frames
+        self.writer.add_scalar("residual/loss", stats["residual_loss"], frame)
+        self.writer.add_scalar("residual/mean_abs", stats["residual_mean_abs"], frame)
+        self.writer.add_scalar("residual/n_real_samples", stats["n_real_samples"], frame)
+        self.writer.add_scalar("residual/alpha", self.current_alpha(), frame)
         if stats["residual_mean_abs"] > 0.1:
             print(
                 f"[residual] WARN: mean|V_residual|={stats['residual_mean_abs']:.4f} "

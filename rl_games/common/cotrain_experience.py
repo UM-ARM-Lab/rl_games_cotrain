@@ -260,6 +260,40 @@ class RewSubConsumer(ScoreConsumer):
         rewards.sub_(reject * self.reward_subtract)
 
 
+class RewScaleConsumer(ScoreConsumer):
+    """pre-GAE: blend td['rewards'] toward `reward_floor` based on per-cell weights.
+
+    Operation:  r' = w * r + (1 - w) * reward_floor
+
+    With `scoring_mode='softmax'`, weights are exp(-score / temperature) ∈ (0, 1]
+    for MSE scores ≥ 0. Bad-prediction chunks (small w) get rewards pulled toward
+    `reward_floor`; good chunks (w → 1) keep their original rewards.
+
+    Real-env cells and outside-window cells have w = 1.0 by construction, so
+    rewards there are untouched.
+
+    Sign-aware by design: works correctly for negative rewards (penalties get
+    deepened toward the floor instead of shrunk toward zero).
+
+    Binary scoring degenerates to RewLowConsumer with the same floor; the
+    buffer asserts scoring_mode='softmax' at construction to keep the contract
+    distinct.
+    """
+
+    PHASE = "pre_gae"
+
+    def __init__(self, reward_floor: float):
+        self.reward_floor = float(reward_floor)
+
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        rewards = td["rewards"]                                          # (T, N, value_size)
+        assert weights.shape == rewards.shape[:2], (
+            f"weights shape {tuple(weights.shape)} must match rewards "
+            f"shape[:2] {tuple(rewards.shape[:2])}"
+        )
+        scale = weights.unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
+        rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
+
 class LossWeightConsumer(ScoreConsumer):
     """Reserved for a follow-up. Will pass per-cell weights into the PPO
     surrogate / value loss directly. Spec section 'Open Questions' in

@@ -8,11 +8,19 @@ re-sync this override.
 """
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.distributed as dist
+from tqdm import trange
 
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 from rl_games.algos_torch.residual_value import ResidualValueTrain
+from rl_games.common.a2c_common import (
+    _filter_train_done_indices,
+    _slice_batch_dict_to_train,
+    swap_and_flatten01,
+)
 
 
 def compute_v_used_raw(
@@ -216,3 +224,162 @@ class A2CResidualAgent(A2CAgent):
     def get_sim_values(self, obs) -> torch.Tensor:
         """V_sim alone — used for the V_sim-only GAE pass bootstrap."""
         return A2CAgent.get_values(self, obs)
+
+    def play_steps(self):
+        # Mirror of ContinuousA2CBase.play_steps with four marked insertions
+        # for the residual-value two-pass GAE split. Re-sync if upstream
+        # changes the base body (a2c_common.py:877-986).
+        self.experience_buffer.paint_is_real()  # Insertion #1
+
+        update_list = self.update_list
+
+        step_time = 0.0
+
+        for n in trange(self.horizon_length, leave=False, desc="Playing steps"):
+            if self.use_action_masks:
+                masks = self.vec_env.get_action_masks()
+                res_dict = self.get_masked_action_values(self.obs, masks)
+            else:
+                res_dict = self.get_action_values(self.obs)
+            self.experience_buffer.update_data("obses", n, self.obs["obs"])
+            self.experience_buffer.update_data("dones", n, self.dones)
+
+            for k in update_list:
+                self.experience_buffer.update_data(k, n, res_dict[k])
+            if self.has_central_value:
+                self.experience_buffer.update_data("states", n, self.obs["states"])
+
+            step_time_start = time.time()
+            # Val envs use mean actions for deterministic rollout (comparable to dedicated eval)
+            step_actions = res_dict["actions"]
+            if self.num_val > 0:
+                step_actions = step_actions.clone()
+                step_actions[self.num_train:] = res_dict["mus"][self.num_train:]
+            self.obs, rewards, self.dones, infos = self.env_step(step_actions)
+
+            step_time_end = time.time()
+
+            step_time += step_time_end - step_time_start
+
+            # Insertion #2 — two-stream value-bootstrap split.
+            shaped_rewards = self.rewards_shaper(rewards)
+            if self.value_bootstrap and "time_outs" in infos:
+                time_outs = self.cast_obs(infos["time_outs"]).unsqueeze(1).float()
+                rewards_used, rewards_sim = apply_value_bootstrap_split(
+                    shaped_rewards, time_outs,
+                    res_dict["values"],          # V_used (overwritten in get_action_values)
+                    res_dict["values_sim"],      # V_sim alone
+                    self.gamma,
+                )
+            else:
+                rewards_used = shaped_rewards
+                rewards_sim = shaped_rewards.clone()
+            self.experience_buffer.update_data("rewards", n, rewards_used)
+            self.experience_buffer.update_data("rewards_sim", n, rewards_sim)
+
+            self.current_rewards += rewards
+            self.current_shaped_rewards += shaped_rewards
+            self.current_lengths += 1
+            all_done_indices = self.dones.nonzero(as_tuple=False)
+            env_done_indices = all_done_indices[:: self.num_agents]
+
+            # For train/val setups, exclude val env done episodes from reward tracking.
+            # Val envs (large hole, easier) would inflate mean_rewards and bias checkpoint saves.
+            # process_infos uses env-level aggregates from the env itself, so it keeps full indices.
+            train_done_indices = (
+                _filter_train_done_indices(env_done_indices, self.num_train)
+                if self.env_has_train_val
+                else env_done_indices
+            )
+
+            self.game_rewards.update(self.current_rewards[train_done_indices])
+            self.game_shaped_rewards.update(self.current_shaped_rewards[train_done_indices])
+            self.game_lengths.update(self.current_lengths[train_done_indices])
+            self.algo_observer.process_infos(infos, env_done_indices)
+
+            not_dones = 1.0 - self.dones.float()
+
+            self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
+            self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
+            self.current_lengths = self.current_lengths * not_dones
+
+        last_values = self.get_values(self.obs)
+        last_values_sim = self.get_sim_values(self.obs)  # Insertion #3
+
+        fdones = self.dones.float()
+        mb_fdones = self.experience_buffer.tensor_dict["dones"].float()
+        mb_values = self.experience_buffer.tensor_dict["values"]
+        mb_rewards = self.experience_buffer.tensor_dict["rewards"]
+        mb_masks = self.experience_buffer.tensor_dict.get("mask", None)
+
+        # mod_method=rew_low/rew_sub mutates mb_rewards in-place here so GAE
+        # propagates the penalty backward. mod_method=filter is a no-op.
+        if self.cotrain_enabled:
+            self.experience_buffer.apply_pre_gae(self.experience_buffer.tensor_dict)
+
+        if mb_masks is not None:
+            mb_advs = self.discount_values_masks(
+                fdones, last_values, mb_fdones, mb_values, mb_rewards, mb_masks.float()
+            )
+        else:
+            mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
+        mb_returns = mb_advs + mb_values
+
+        # Insertion #4 (a) — second GAE pass with V_sim alone — produces
+        # returns_sim for V_sim's regression target in prepare_dataset.
+        mb_values_sim = self.experience_buffer.tensor_dict["values_sim"]
+        mb_rewards_sim = self.experience_buffer.tensor_dict["rewards_sim"]
+        mb_advs_sim = self.discount_values(
+            fdones, last_values_sim, mb_fdones, mb_values_sim, mb_rewards_sim,
+        )
+        mb_returns_sim = mb_advs_sim + mb_values_sim
+
+        batch_dict = {}
+        if self.cotrain_enabled:
+            self.experience_buffer.update_data_full("returns", mb_returns)
+            self.experience_buffer.update_data_full("returns_sim", mb_returns_sim)  # Insertion #4 (b)
+            self.experience_buffer.apply_post_gae(
+                td=self.experience_buffer.tensor_dict,
+                rnn_states_raw=None,
+                seq_length=self.horizon_length,
+            )
+            # Insertion #4 (d) — alpha-schedule counter increment.
+            n_real_this_rollout = (
+                self.horizon_length * int(self.experience_buffer.real_env_idx.numel())
+            )
+            self.n_real_steps_seen += n_real_this_rollout
+            tensor_list_with_return = self.tensor_list + ["returns", "returns_sim"]  # Insertion #4 (c)
+            batch_dict = self.experience_buffer.get_transformed_list(
+                swap_and_flatten01, tensor_list_with_return
+            )
+        else:        # old method
+            batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
+            batch_dict["returns"] = swap_and_flatten01(mb_returns)
+        batch_dict["played_frames"] = self.batch_size
+        batch_dict["step_time"] = step_time
+
+        # Slice out val env rows so prepare_dataset normalizes only over train envs.
+        # After swap_and_flatten01, layout is [train_rows | val_rows] with boundary at batch_size.
+        if self.env_has_train_val:
+            batch_dict = _slice_batch_dict_to_train(batch_dict, self.batch_size)
+
+        return batch_dict
+
+
+def apply_value_bootstrap_split(
+    shaped_rewards: torch.Tensor,
+    time_outs: torch.Tensor,
+    v_used_raw: torch.Tensor,
+    v_sim_raw: torch.Tensor,
+    gamma: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two reward tensors for the two-GAE-pass split.
+
+    On time-out cells (time_outs != 0), value_bootstrap adds gamma*V*time_outs
+    to the reward. We need:
+      - rewards_used: bootstraps with V_used (for policy GAE)
+      - rewards_sim:  bootstraps with V_sim alone (for V_sim-only GAE)
+    """
+    rewards_used = shaped_rewards + gamma * v_used_raw * time_outs
+    rewards_sim = shaped_rewards + gamma * v_sim_raw * time_outs
+    return rewards_used, rewards_sim

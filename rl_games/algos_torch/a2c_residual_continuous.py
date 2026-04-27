@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from tqdm import trange
 
+from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 from rl_games.algos_torch.residual_value import ResidualValueTrain
 from rl_games.common.a2c_common import (
@@ -377,6 +378,113 @@ class A2CResidualAgent(A2CAgent):
             batch_dict = _slice_batch_dict_to_train(batch_dict, self.batch_size)
 
         return batch_dict
+
+    def prepare_dataset(self, batch_dict):
+        """RESIDUAL-MODE override of ContinuousA2CBase.prepare_dataset.
+
+        Mirrors the base body verbatim except:
+          - value_mean_std updates run against values_sim + returns_sim (not
+            V_used) so V_sim's normalization tracks V_sim's distribution.
+          - dataset["old_values"] and dataset["returns"] are V_sim's normalized
+            tensors (the critic loss regresses V_sim).
+          - advantages still come from V_used GAE (policy-side).
+          - Adds residual-specific dataset entries: is_real, target_resid_norm,
+            values_sim, residual_values_norm.
+          - Stashes dataset_dict on self._last_dataset for train_epoch.
+        """
+        obses = batch_dict["obses"]
+        returns = batch_dict["returns"]                 # V_used GAE returns
+        dones = batch_dict["dones"]
+        values = batch_dict["values"]                   # V_used per-step
+        actions = batch_dict["actions"]
+        neglogpacs = batch_dict["neglogpacs"]
+        mus = batch_dict["mus"]
+        sigmas = batch_dict["sigmas"]
+        rnn_states = batch_dict.get("rnn_states", None)
+        rnn_masks = batch_dict.get("rnn_masks", None)
+
+        # NEW: residual-specific tensors.
+        returns_sim = batch_dict["returns_sim"]
+        values_sim = batch_dict["values_sim"]
+        residual_values_norm = batch_dict["residual_values_norm"]
+        is_real = batch_dict["is_real"]
+
+        # advantages from V_used (policy-side) — UNCHANGED from base.
+        advantages = returns - values
+
+        # MOD #1: route the base's two-update pattern through V_sim tensors.
+        # Base does train(), forward(values), forward(returns), then disables
+        # training. We do train(True), forward(values_sim), forward(returns_sim),
+        # train(False). At alpha=0, values_sim == values and returns_sim ==
+        # returns, so the two RMS updates are bit-identical to base. Using
+        # train(True/False) instead of the named-mode helpers to avoid hook flags.
+        if self.normalize_value:
+            self.value_mean_std.train(True)
+            values_sim_norm = self.value_mean_std(values_sim)
+            returns_sim_norm = self.value_mean_std(returns_sim)
+            self.value_mean_std.train(False)
+        else:
+            values_sim_norm = values_sim
+            returns_sim_norm = returns_sim
+
+        # MOD #2: residual target in normalized space (stop-grad).
+        target_resid_norm = (returns_sim_norm - values_sim_norm).detach()
+
+        advantages = torch.sum(advantages, axis=1)
+
+        if self.normalize_advantage:
+            if self.is_rnn:
+                if self.normalize_rms_advantage:
+                    advantages = self.advantage_mean_std(advantages, mask=rnn_masks)
+                else:
+                    advantages = torch_ext.normalization_with_masks(advantages, rnn_masks)
+            else:
+                if self.normalize_rms_advantage:
+                    advantages = self.advantage_mean_std(advantages)
+                else:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # MOD #3: dataset_dict — old_values and returns OVERRIDDEN to V_sim
+        # normalized tensors. The critic loss regresses V_sim toward returns_sim,
+        # NOT V_used toward returns_used. advantages stays from V_used GAE.
+        dataset_dict = {}
+        dataset_dict["old_values"] = values_sim_norm           # OVERRIDE: V_sim normalized
+        dataset_dict["old_logp_actions"] = neglogpacs
+        dataset_dict["advantages"] = advantages                 # V_used GAE (policy)
+        dataset_dict["returns"] = returns_sim_norm              # OVERRIDE: V_sim normalized
+        dataset_dict["actions"] = actions
+        dataset_dict["obs"] = obses
+        dataset_dict["dones"] = dones
+        dataset_dict["rnn_states"] = rnn_states
+        dataset_dict["rnn_masks"] = rnn_masks
+        dataset_dict["mu"] = mus
+        dataset_dict["sigma"] = sigmas
+        # NEW residual-specific keys (used by train_epoch in Task 8):
+        dataset_dict["is_real"] = is_real
+        dataset_dict["target_resid_norm"] = target_resid_norm
+        dataset_dict["values_sim"] = values_sim
+        dataset_dict["residual_values_norm"] = residual_values_norm
+
+        self.dataset.update_values_dict(dataset_dict)
+
+        # Preserve the central_value branch from the base — UNCHANGED in
+        # semantics, but renamed to dataset_dict_cv to avoid clobbering the
+        # dataset_dict we stash on self._last_dataset below. The base body
+        # reuses the variable name because it doesn't need the original;
+        # we do.
+        if self.has_central_value:
+            dataset_dict_cv = {}
+            dataset_dict_cv["old_values"] = values_sim_norm    # V_sim normalized
+            dataset_dict_cv["advantages"] = advantages
+            dataset_dict_cv["returns"] = returns_sim_norm
+            dataset_dict_cv["actions"] = actions
+            dataset_dict_cv["obs"] = batch_dict["states"]
+            dataset_dict_cv["dones"] = dones
+            dataset_dict_cv["rnn_masks"] = rnn_masks
+            self.central_value_net.update_dataset(dataset_dict_cv)
+
+        # MOD #4: stash for the residual training step in train_epoch (Task 8).
+        self._last_dataset = dataset_dict
 
 
 def apply_value_bootstrap_split(

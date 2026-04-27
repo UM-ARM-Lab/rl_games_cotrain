@@ -65,6 +65,10 @@ class A2CResidualAgent(A2CAgent):
             "A2CResidualAgent: value_mean_std must be the model's, not the "
             "central value net's, so the residual head shares normalization."
         )
+        assert self.cotrain_enabled, (
+            "A2CResidualAgent requires cotrain.enabled=True (residual mode is "
+            "built on the cotrain experience buffer)."
+        )
 
         rcfg = self.config["residual_value_config"]
         self.residual_value_net = ResidualValueTrain(
@@ -182,15 +186,19 @@ class A2CResidualAgent(A2CAgent):
             writer=getattr(self, "writer", None),
         )
 
-        # Now extend update_list / tensor_list so per-step writes flow through.
-        for key in ("values_sim", "residual_values_norm", "rewards_sim"):
+        # values_sim and residual_values_norm flow from get_action_values (per-step
+        # writes), so they go in update_list. rewards_sim is computed AFTER env_step
+        # (from shaped_rewards) and is written explicitly via update_data, so it
+        # only needs to be in tensor_list (so get_transformed_list picks it up
+        # for batch_dict). is_real is painted per-rollout, also tensor_list only.
+        for key in ("values_sim", "residual_values_norm"):
             if key not in self.update_list:
                 self.update_list.append(key)
             if key not in self.tensor_list:
                 self.tensor_list.append(key)
-        # is_real is painted per-rollout (not per-step), but still flows in tensor_list.
-        if "is_real" not in self.tensor_list:
-            self.tensor_list.append("is_real")
+        for key in ("rewards_sim", "is_real"):
+            if key not in self.tensor_list:
+                self.tensor_list.append(key)
 
         td = self.experience_buffer.tensor_dict
         for key in ("values_sim", "residual_values_norm", "rewards_sim", "is_real"):
@@ -329,9 +337,14 @@ class A2CResidualAgent(A2CAgent):
         # returns_sim for V_sim's regression target in prepare_dataset.
         mb_values_sim = self.experience_buffer.tensor_dict["values_sim"]
         mb_rewards_sim = self.experience_buffer.tensor_dict["rewards_sim"]
-        mb_advs_sim = self.discount_values(
-            fdones, last_values_sim, mb_fdones, mb_values_sim, mb_rewards_sim,
-        )
+        if mb_masks is not None:
+            mb_advs_sim = self.discount_values_masks(
+                fdones, last_values_sim, mb_fdones, mb_values_sim, mb_rewards_sim, mb_masks.float(),
+            )
+        else:
+            mb_advs_sim = self.discount_values(
+                fdones, last_values_sim, mb_fdones, mb_values_sim, mb_rewards_sim,
+            )
         mb_returns_sim = mb_advs_sim + mb_values_sim
 
         batch_dict = {}

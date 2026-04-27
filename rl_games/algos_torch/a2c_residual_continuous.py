@@ -8,10 +8,6 @@ re-sync this override.
 """
 from __future__ import annotations
 
-import copy
-import time
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 
@@ -105,3 +101,115 @@ class A2CResidualAgent(A2CAgent):
         A2CAgent.set_full_state_weights(self, weights, set_epoch=set_epoch)
         self.residual_value_net.load_state(weights.get("residual_value"))
         self.n_real_steps_seen = int(weights.get("n_real_steps_seen", 0))
+
+    def _sigma(self) -> torch.Tensor:
+        """Sigma from value_mean_std.running_var."""
+        return self.value_mean_std.running_var.sqrt()
+
+    def _normalize_v_sim_raw(self, v_sim_raw: torch.Tensor) -> torch.Tensor:
+        """Convert raw V_sim values to normalized space using value_mean_std
+        in eval mode (no stats update). value_mean_std defaults to eval mode
+        after construction; calling forward normalizes (subtracts mean, divides
+        by std) without updating the running stats."""
+        if not self.normalize_value:
+            return v_sim_raw
+        return self.value_mean_std(v_sim_raw)
+
+    def _normalize_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        """Normalize obs using the same running stats as V_sim's input
+        normalization. This makes V_residual's input distribution match what
+        V_sim sees, per spec §5 (input is `obs ⊕ sg(V_sim_norm)` in
+        normalized obs space)."""
+        if not getattr(self, "normalize_input", False):
+            return obs
+        rms = getattr(self.model, "running_mean_std", None)
+        if rms is None:
+            return obs
+        return rms(obs)  # eval mode → normalize without update
+
+    def init_tensors(self):
+        # A2CAgent.init_tensors constructs a CotrainExperienceBuffer via
+        # cotrain_cfg, but doesn't pass residual_enabled / real_env_idx.
+        # We let it run, then REPLACE the buffer with a residual-enabled one
+        # constructed with the same kwargs plus the residual fields.
+        A2CAgent.init_tensors(self)
+
+        # Pull the cotrain config; real_env_idx must have been injected by
+        # the experiment setup (dynamics_cotrain/experiments/exp_cotrain_ppo.py).
+        cot = self.cotrain_cfg
+        real_env_idx = cot.get("real_env_idx")
+        assert real_env_idx is not None, (
+            "A2CResidualAgent requires cotrain.real_env_idx to be injected at "
+            "experiment setup. Update dynamics_cotrain/experiments/exp_cotrain_ppo.py "
+            "to inject env.unwrapped.idx_train_real.clone() symmetric to sim_env_idx."
+        )
+
+        from rl_games.common.cotrain_experience import CotrainExperienceBuffer
+        algo_info = {
+            "num_actors": self.num_actors,
+            "horizon_length": self.horizon_length,
+            "has_central_value": self.has_central_value,
+            "use_action_masks": getattr(self, "use_action_masks", False),
+        }
+        self.experience_buffer = CotrainExperienceBuffer(
+            self.env_info,
+            algo_info,
+            self.ppo_device,
+            scorer=cot.get("scorer_object", None),
+            threshold=cot.get("scorer_threshold", None),
+            sim_env_idx=cot.get("sim_env_idx", None),
+            real_env_idx=real_env_idx,                     # NEW (residual mode)
+            residual_enabled=True,                         # NEW (residual mode)
+            scoring_mode=cot.get("scoring_mode", "binary"),
+            temperature=cot.get("temperature", None),
+            score_direction=cot.get("score_direction", "le"),
+            plot_dir=cot.get("plot_dir", None),
+            plot_every=cot.get("plot_every", 1),
+            plot_num_trajectories=cot.get("plot_num_trajectories", 10),
+            mod_method=cot.get("mod_method", "filter"),
+            mod_cfg=cot.get("mod", None),
+            writer=getattr(self, "writer", None),
+        )
+
+        # Now extend update_list / tensor_list so per-step writes flow through.
+        for key in ("values_sim", "residual_values_norm", "rewards_sim"):
+            if key not in self.update_list:
+                self.update_list.append(key)
+            if key not in self.tensor_list:
+                self.tensor_list.append(key)
+        # is_real is painted per-rollout (not per-step), but still flows in tensor_list.
+        if "is_real" not in self.tensor_list:
+            self.tensor_list.append("is_real")
+
+        td = self.experience_buffer.tensor_dict
+        for key in ("values_sim", "residual_values_norm", "rewards_sim", "is_real"):
+            assert key in td, f"experience_buffer is missing {key!r} after init"
+
+    def get_action_values(self, obs):
+        res = A2CAgent.get_action_values(self, obs)
+        v_sim_raw = res["values"]
+        obs_tensor = obs["obs"] if isinstance(obs, dict) else obs
+        # Normalize obs and V_sim to feed the residual head (spec §5).
+        obs_norm = self._normalize_obs(obs_tensor)
+        v_sim_norm = self._normalize_v_sim_raw(v_sim_raw)
+        v_residual_norm = self.residual_value_net.snapshot(obs_norm, v_sim_norm)
+        sigma = self._sigma()
+        alpha = self.current_alpha()
+        res["values_sim"] = v_sim_raw.clone()
+        res["residual_values_norm"] = v_residual_norm
+        res["values"] = compute_v_used_raw(v_sim_raw, v_residual_norm, sigma, alpha)
+        return res
+
+    def get_values(self, obs):
+        v_sim_raw = A2CAgent.get_values(self, obs)
+        obs_tensor = obs["obs"] if isinstance(obs, dict) else obs
+        obs_norm = self._normalize_obs(obs_tensor)
+        v_sim_norm = self._normalize_v_sim_raw(v_sim_raw)
+        v_residual_norm = self.residual_value_net.snapshot(obs_norm, v_sim_norm)
+        sigma = self._sigma()
+        alpha = self.current_alpha()
+        return compute_v_used_raw(v_sim_raw, v_residual_norm, sigma, alpha)
+
+    def get_sim_values(self, obs) -> torch.Tensor:
+        """V_sim alone — used for the V_sim-only GAE pass bootstrap."""
+        return A2CAgent.get_values(self, obs)

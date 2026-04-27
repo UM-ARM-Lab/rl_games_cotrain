@@ -103,8 +103,11 @@ class A2CResidualAgent(A2CAgent):
         self.n_real_steps_seen = int(weights.get("n_real_steps_seen", 0))
 
     def _sigma(self) -> torch.Tensor:
-        """Sigma from value_mean_std.running_var."""
-        return self.value_mean_std.running_var.sqrt()
+        """Sigma matching RunningMeanStd.forward: sqrt(running_var + eps).
+        Cast to float32 to match buffer dtype and avoid silent promotion."""
+        var = self.value_mean_std.running_var
+        eps = self.value_mean_std.epsilon
+        return (var + eps).sqrt().to(torch.float32)
 
     def _normalize_v_sim_raw(self, v_sim_raw: torch.Tensor) -> torch.Tensor:
         """Convert raw V_sim values to normalized space using value_mean_std

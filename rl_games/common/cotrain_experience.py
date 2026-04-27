@@ -222,42 +222,54 @@ class FilterConsumer(ScoreConsumer):
 
 
 class RewLowConsumer(ScoreConsumer):
-    """pre-GAE: floor td['rewards'] on cells where weight == 0.0.
+    """pre-GAE: floor td[reward_keys] on cells where weight == 0.0.
 
     Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
     construction. The consumer reads the weight grid as a {0, 1} mask and
-    writes `reward_floor` into rewards wherever weight == 0.
+    writes `reward_floor` into rewards wherever weight == 0. In residual mode
+    the buffer passes ``reward_keys=['rewards', 'rewards_sim']`` so both
+    streams get floored symmetrically; the default keeps backward compat.
     """
 
     PHASE = "pre_gae"
 
-    def __init__(self, reward_floor: float):
+    def __init__(self, reward_floor: float, reward_keys: Optional[list] = None):
         self.reward_floor = float(reward_floor)
+        self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
 
     def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
-        rewards = td["rewards"]                                          # (T, N, value_size)
-        reject = (weights == 0.0).unsqueeze(-1).expand_as(rewards)        # (T, N, value_size)
-        rewards[reject] = self.reward_floor
+        for key in self.reward_keys:
+            if key not in td:
+                continue
+            rewards = td[key]                                            # (T, N, value_size)
+            reject = (weights == 0.0).unsqueeze(-1).expand_as(rewards)    # (T, N, value_size)
+            rewards[reject] = self.reward_floor
 
 
 class RewSubConsumer(ScoreConsumer):
-    """pre-GAE: subtract `reward_subtract` from td['rewards'] on cells where
+    """pre-GAE: subtract `reward_subtract` from td[reward_keys] on cells where
     weight == 0.0. Sign convention: positive reward_subtract = penalty
     (rewards go down on rejected cells).
 
     Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
-    construction.
+    construction. In residual mode the buffer passes
+    ``reward_keys=['rewards', 'rewards_sim']`` so both streams get penalized
+    symmetrically; the default keeps backward compat.
     """
 
     PHASE = "pre_gae"
 
-    def __init__(self, reward_subtract: float):
+    def __init__(self, reward_subtract: float, reward_keys: Optional[list] = None):
         self.reward_subtract = float(reward_subtract)
+        self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
 
     def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
-        rewards = td["rewards"]                                                  # (T, N, value_size)
-        reject = (weights == 0.0).unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
-        rewards.sub_(reject * self.reward_subtract)
+        for key in self.reward_keys:
+            if key not in td:
+                continue
+            rewards = td[key]                                                  # (T, N, value_size)
+            reject = (weights == 0.0).unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
+            rewards.sub_(reject * self.reward_subtract)
 
 
 class RewScaleConsumer(ScoreConsumer):
@@ -342,6 +354,8 @@ class CotrainExperienceBuffer:
         mod_method: str = "filter",
         mod_cfg: Optional[dict] = None,
         writer=None,
+        residual_enabled: bool = False,
+        real_env_idx: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -385,6 +399,25 @@ class CotrainExperienceBuffer:
         self.device = device
         self.writer = writer
         self._log_step = 0
+
+        self.residual_enabled = bool(residual_enabled)
+        self.real_env_idx = (
+            real_env_idx.to(device).long()
+            if real_env_idx is not None else None
+        )
+
+        if self.residual_enabled:
+            assert self.real_env_idx is not None, (
+                "residual_enabled=True requires real_env_idx (1-D LongTensor)"
+            )
+            T = algo_info["horizon_length"]
+            N = algo_info["num_actors"]
+            value_size = env_info.get("value_size", 1)
+            td = self.buffer.tensor_dict
+            td["values_sim"] = torch.zeros(T, N, value_size, device=device)
+            td["residual_values_norm"] = torch.zeros(T, N, value_size, device=device)
+            td["rewards_sim"] = torch.zeros(T, N, value_size, device=device)
+            td["is_real"] = torch.zeros(T, N, dtype=torch.bool, device=device)
 
         self.scoring_mode = scoring_mode
 
@@ -446,7 +479,10 @@ class CotrainExperienceBuffer:
             assert "reward_floor" in self.mod_cfg, (
                 "mod_method='rew_low' requires mod_cfg['reward_floor']"
             )
-            self._consumer = RewLowConsumer(reward_floor=self.mod_cfg["reward_floor"])
+            keys = ["rewards", "rewards_sim"] if self.residual_enabled else ["rewards"]
+            self._consumer = RewLowConsumer(
+                reward_floor=self.mod_cfg["reward_floor"], reward_keys=keys,
+            )
         elif mod_method == "rew_sub":
             assert scoring_mode == "binary", (
                 f"mod_method='rew_sub' requires scoring_mode='binary', got {scoring_mode!r}"
@@ -454,7 +490,10 @@ class CotrainExperienceBuffer:
             assert "reward_subtract" in self.mod_cfg, (
                 "mod_method='rew_sub' requires mod_cfg['reward_subtract']"
             )
-            self._consumer = RewSubConsumer(reward_subtract=self.mod_cfg["reward_subtract"])
+            keys = ["rewards", "rewards_sim"] if self.residual_enabled else ["rewards"]
+            self._consumer = RewSubConsumer(
+                reward_subtract=self.mod_cfg["reward_subtract"], reward_keys=keys,
+            )
         elif mod_method == "rew_scale":
             assert scoring_mode == "softmax", (
                 f"mod_method='rew_scale' requires scoring_mode='softmax' "
@@ -488,6 +527,16 @@ class CotrainExperienceBuffer:
 
     def update_data_full(self, name: str, val: torch.Tensor):
         self.buffer.tensor_dict[name] = val
+
+    def paint_is_real(self) -> None:
+        """Set is_real[:, real_env_idx] = True. Called once per rollout from
+        play_steps; column-pure pre-resample, but FilterConsumer may shuffle
+        rows so post-resample is_real is per-cell (see spec §6.2)."""
+        if not self.residual_enabled:
+            return
+        is_real = self.buffer.tensor_dict["is_real"]
+        is_real.zero_()
+        is_real[:, self.real_env_idx] = True
 
     # ------------------------------------------------------------------
     # Scoring + Resampling

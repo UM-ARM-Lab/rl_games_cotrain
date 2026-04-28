@@ -90,6 +90,10 @@ class A2CResidualAgent(A2CAgent):
         # Populated by prepare_dataset (called inside base train_epoch). The
         # train_epoch override below reads it after delegating to base.
         self._last_dataset = None
+        # Cached alpha for the current rollout. Refreshed at the start of
+        # play_steps so the H per-step get_action_values calls + bootstrap
+        # don't each issue a redundant dist.all_reduce under multi-GPU.
+        self._cached_alpha = None
 
     def _infer_obs_dim(self) -> int:
         shape = getattr(self, "obs_shape", None)
@@ -100,12 +104,21 @@ class A2CResidualAgent(A2CAgent):
         return int(shape)
 
     def current_alpha(self) -> float:
+        if self._cached_alpha is not None:
+            return self._cached_alpha
+        return self._compute_alpha()
+
+    def _compute_alpha(self) -> float:
         n = self.n_real_steps_seen
         if self.multi_gpu and dist.is_available() and dist.is_initialized():
             t = torch.tensor([n], device=self.ppo_device, dtype=torch.long)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             n = int(t.item())
         return self.residual_value_net.alpha(n)
+
+    def _refresh_alpha_cache(self) -> None:
+        """Compute and cache alpha once per rollout (called at start of play_steps)."""
+        self._cached_alpha = self._compute_alpha()
 
     def get_full_state_weights(self):
         state = A2CAgent.get_full_state_weights(self)
@@ -242,6 +255,11 @@ class A2CResidualAgent(A2CAgent):
         # for the residual-value two-pass GAE split. Re-sync if upstream
         # changes the base body (a2c_common.py:877-986).
         self.experience_buffer.paint_is_real()  # Insertion #1
+        # Cache alpha once per rollout. n_real_steps_seen only changes once
+        # per rollout (post-loop), so the H per-step current_alpha() reads
+        # below all see the same value — the cache eliminates H+ redundant
+        # dist.all_reduce collectives under multi-GPU.
+        self._refresh_alpha_cache()
 
         update_list = self.update_list
 
@@ -365,6 +383,9 @@ class A2CResidualAgent(A2CAgent):
                 self.horizon_length * int(self.experience_buffer.real_env_idx.numel())
             )
             self.n_real_steps_seen += n_real_this_rollout
+            # Cache is now stale — invalidate so post-rollout current_alpha()
+            # (e.g. _log_residual_stats) recomputes from the updated counter.
+            self._cached_alpha = None
             tensor_list_with_return = self.tensor_list + ["returns", "returns_sim"]  # Insertion #4 (c)
             batch_dict = self.experience_buffer.get_transformed_list(
                 swap_and_flatten01, tensor_list_with_return

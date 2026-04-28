@@ -294,17 +294,21 @@ class RewScaleConsumer(ScoreConsumer):
 
     PHASE = "pre_gae"
 
-    def __init__(self, reward_floor: float):
+    def __init__(self, reward_floor: float, reward_keys: Optional[list] = None):
         self.reward_floor = float(reward_floor)
+        self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
 
     def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
-        rewards = td["rewards"]                                          # (T, N, value_size)
-        assert weights.shape == rewards.shape[:2], (
-            f"weights shape {tuple(weights.shape)} must match rewards "
-            f"shape[:2] {tuple(rewards.shape[:2])}"
-        )
-        scale = weights.unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
-        rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
+        for key in self.reward_keys:
+            if key not in td:
+                continue
+            rewards = td[key]                                            # (T, N, value_size)
+            assert weights.shape == rewards.shape[:2], (
+                f"weights shape {tuple(weights.shape)} must match rewards "
+                f"shape[:2] {tuple(rewards.shape[:2])}"
+            )
+            scale = weights.unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
+            rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
 
 class LossWeightConsumer(ScoreConsumer):
     """Reserved for a follow-up. Will pass per-cell weights into the PPO
@@ -502,7 +506,10 @@ class CotrainExperienceBuffer:
             assert "reward_floor" in self.mod_cfg, (
                 "mod_method='rew_scale' requires mod_cfg['reward_floor']"
             )
-            self._consumer = RewScaleConsumer(reward_floor=self.mod_cfg["reward_floor"])
+            keys = ["rewards", "rewards_sim"] if self.residual_enabled else ["rewards"]
+            self._consumer = RewScaleConsumer(
+                reward_floor=self.mod_cfg["reward_floor"], reward_keys=keys,
+            )
         elif mod_method == "loss_weight":
             self._consumer = LossWeightConsumer()  # raises NotImplementedError
         else:

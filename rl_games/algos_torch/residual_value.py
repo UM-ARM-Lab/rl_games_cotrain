@@ -91,6 +91,10 @@ class ResidualValueTrain(nn.Module):
         assert warmup_real_steps >= 0
         assert ramp_real_steps > 0
         assert mini_epochs >= 1
+        assert not mixed_precision, (
+            "mixed_precision=True is unsupported — fp16 residual training is "
+            "deferred per spec §6.2 (no GradScaler / autocast wired in train_step)."
+        )
 
         self.lambda_l2 = float(lambda_l2)
         self.warmup_real_steps = int(warmup_real_steps)

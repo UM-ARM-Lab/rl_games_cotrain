@@ -8,15 +8,18 @@ re-sync this override.
 """
 from __future__ import annotations
 
+import hashlib
 import time
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 from tqdm import trange
 
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 from rl_games.algos_torch.residual_value import ResidualValueTrain
+from rl_games.common import common_losses
 from rl_games.common.a2c_common import (
     _filter_train_done_indices,
     _slice_batch_dict_to_train,
@@ -94,6 +97,15 @@ class A2CResidualAgent(A2CAgent):
         # play_steps so the H per-step get_action_values calls + bootstrap
         # don't each issue a redundant dist.all_reduce under multi-GPU.
         self._cached_alpha = None
+        # Per-rollout diagnostic metrics computed in play_steps after both
+        # GAE passes, logged from train_epoch alongside residual training stats.
+        self._rollout_diag: dict[str, float] = {}
+        # Per-minibatch accumulators populated by calc_gradients overrides.
+        # Reset at the start of every train_epoch.
+        self._mb_ratio_extreme_count = 0
+        self._mb_ratio_total = 0
+        self._mb_grad_norm_max = 0.0
+        self._mb_grad_norm_nonfinite = False
 
     def _infer_obs_dim(self) -> int:
         shape = getattr(self, "obs_shape", None)
@@ -369,6 +381,20 @@ class A2CResidualAgent(A2CAgent):
             )
         mb_returns_sim = mb_advs_sim + mb_values_sim
 
+        # Insertion #4 (e) — rollout-level diagnostic metrics. Computed here
+        # because we have all tensors (V_used vs V_sim, both GAE passes,
+        # is_real mask) in their pre-flatten layout. Logged in train_epoch.
+        self._compute_rollout_diag(
+            mb_values=mb_values,
+            mb_values_sim=mb_values_sim,
+            mb_advs=mb_advs,
+            mb_advs_sim=mb_advs_sim,
+            mb_returns=mb_returns,
+            mb_returns_sim=mb_returns_sim,
+            mb_residual_norm=self.experience_buffer.tensor_dict["residual_values_norm"],
+            mb_is_real=self.experience_buffer.tensor_dict["is_real"].bool(),
+        )
+
         batch_dict = {}
         if self.cotrain_enabled:
             self.experience_buffer.update_data_full("returns", mb_returns)
@@ -517,6 +543,16 @@ class A2CResidualAgent(A2CAgent):
         the PPO inner loop. We delegate to it (no copy of the inner-loop
         body) and slot residual training in afterward.
         """
+        # Reset per-iter metric accumulators populated by calc_gradients
+        # and trancate_gradients_and_step. Their values flush in
+        # _log_residual_stats at the end of this method.
+        self._mb_ratio_extreme_count = 0
+        self._mb_ratio_total = 0
+        self._mb_grad_norm_max = 0.0
+        self._mb_grad_norm_nonfinite = False
+        # Capture RNG state at the start of this iteration. Logged at end.
+        rng_fingerprint = self._compute_rng_fingerprint()
+
         self.residual_value_net.refresh_snapshot()
         result = A2CAgent.train_epoch(self)
 
@@ -534,35 +570,340 @@ class A2CResidualAgent(A2CAgent):
                     self.value_mean_std(v_sim_real) if self.normalize_value else v_sim_real
                 )
             target_real = ds["target_resid_norm"][is_real]
-            stats = self.residual_value_net.train_net(
-                obs_real=obs_real,
-                v_sim_real=v_sim_norm_real,
-                target_real=target_real,
-                minibatch_size=self.minibatch_size,
-            )
+            # Install a backward hook on actor params that fires if any
+            # gradient is accumulated into them during V_residual.train_step.
+            # An accumulated grad here would mean the residual loss has an
+            # accidental autograd path into the actor (Mode 2 hypothesis H_B).
+            hook_handles, leak_flag = self._install_actor_grad_leak_hook()
+            try:
+                stats = self.residual_value_net.train_net(
+                    obs_real=obs_real,
+                    v_sim_real=v_sim_norm_real,
+                    target_real=target_real,
+                    minibatch_size=self.minibatch_size,
+                )
+            finally:
+                for h in hook_handles:
+                    h.remove()
+            stats["actor_grad_leaked"] = bool(leak_flag[0])
         else:
             # No real data this rollout — log zero-sample marker so the alpha
             # curve has no gaps and misconfiguration (e.g., empty real_env_idx)
             # is visible in TensorBoard.
-            stats = {"residual_loss": 0.0, "residual_mean_abs": 0.0, "n_real_samples": 0}
-        self._log_residual_stats(stats)
+            stats = {
+                "residual_loss": 0.0,
+                "residual_mean_abs": 0.0,
+                "n_real_samples": 0,
+                "actor_grad_leaked": False,
+            }
+        self._log_residual_stats(stats, rng_fingerprint=rng_fingerprint)
         return result
 
-    def _log_residual_stats(self, stats: dict) -> None:
+    def _log_residual_stats(self, stats: dict, *, rng_fingerprint: int) -> None:
         if not hasattr(self, "writer") or self.writer is None:
             return
         # Match write_stats' post-increment frame so residual/* and losses/*
         # scalars line up at the same TB step for the same iteration.
         frame = self.frame + self.curr_frames
-        self.writer.add_scalar("residual/loss", stats["residual_loss"], frame)
-        self.writer.add_scalar("residual/mean_abs", stats["residual_mean_abs"], frame)
-        self.writer.add_scalar("residual/n_real_samples", stats["n_real_samples"], frame)
-        self.writer.add_scalar("residual/alpha", self.current_alpha(), frame)
+        w = self.writer
+        w.add_scalar("residual/loss", stats["residual_loss"], frame)
+        w.add_scalar("residual/mean_abs", stats["residual_mean_abs"], frame)
+        w.add_scalar("residual/n_real_samples", stats["n_real_samples"], frame)
+        w.add_scalar("residual/alpha", self.current_alpha(), frame)
+        # Mode-1 dataset-split metrics (computed in _compute_rollout_diag).
+        for k, v in self._rollout_diag.items():
+            w.add_scalar(k, v, frame)
+        # Mode-2 per-minibatch accumulators flushed from calc_gradients /
+        # trancate_gradients_and_step.
+        ratio_frac = (
+            self._mb_ratio_extreme_count / max(1, self._mb_ratio_total)
+        )
+        w.add_scalar("ppo/ratio_extreme_frac", ratio_frac, frame)
+        w.add_scalar(
+            "ppo/grad_norm_pre_clip_max",
+            float("inf") if self._mb_grad_norm_nonfinite else self._mb_grad_norm_max,
+            frame,
+        )
+        w.add_scalar("debug/rng_fingerprint", float(rng_fingerprint), frame)
+        w.add_scalar("debug/actor_grad_leaked", float(stats["actor_grad_leaked"]), frame)
         if stats["residual_mean_abs"] > 0.1:
             print(
                 f"[residual] WARN: mean|V_residual|={stats['residual_mean_abs']:.4f} "
                 f"exceeds 0.1 — sigma-only fusion presumes mean-zero."
             )
+        if stats["actor_grad_leaked"]:
+            print(
+                "[residual] ERROR: actor parameter received a gradient during "
+                "V_residual.train_step — the residual loss has an autograd path "
+                "into the actor. This is a Mode 2 H_B failure."
+            )
+
+    def _compute_rollout_diag(
+        self,
+        *,
+        mb_values: torch.Tensor,
+        mb_values_sim: torch.Tensor,
+        mb_advs: torch.Tensor,
+        mb_advs_sim: torch.Tensor,
+        mb_returns: torch.Tensor,
+        mb_returns_sim: torch.Tensor,
+        mb_residual_norm: torch.Tensor,
+        mb_is_real: torch.Tensor,
+    ) -> None:
+        """Populate self._rollout_diag with sim/real-split metrics.
+
+        Shapes: (T, N, value_size) for value tensors and advantages,
+        (T, N) for mb_is_real. Splits along the (T, N) flat axis.
+        """
+        with torch.no_grad():
+            real = mb_is_real
+            sim = ~real
+            n_sim = int(sim.sum().item())
+            n_real = int(real.sum().item())
+
+            res = mb_residual_norm
+            # Flatten value_size by mean — value_size is 1 in our config so this
+            # is a no-op, but written symbolically to be robust.
+            res_per_cell = res.mean(dim=-1)
+            res_abs = res_per_cell.abs()
+
+            c = float(self.residual_value_net.live.c)
+            sigma = self._sigma()
+            alpha = self.current_alpha()
+
+            # Mode-1 metrics.
+            mean_sim = res_per_cell[sim].mean().item() if n_sim > 0 else 0.0
+            mean_real = res_per_cell[real].mean().item() if n_real > 0 else 0.0
+            std_sim = res_per_cell[sim].std().item() if n_sim > 1 else 0.0
+            frac_sat = (res_abs > 0.9 * c).float().mean().item()
+            # advantage shift = (adv_used - adv_sim) averaged over sim cells.
+            adv_diff = mb_advs - mb_advs_sim
+            adv_diff_per_cell = adv_diff.mean(dim=-1)
+            adv_shift_sim = (
+                adv_diff_per_cell[sim].mean().item() if n_sim > 0 else 0.0
+            )
+            # Sign flip: sign(adv_used) != sign(adv_sim) per cell, sim only.
+            sign_used = mb_advs.mean(dim=-1).sign()
+            sign_sim = mb_advs_sim.mean(dim=-1).sign()
+            flips = (sign_used != sign_sim)
+            sign_flip_frac = (
+                flips[sim].float().mean().item() if n_sim > 0 else 0.0
+            )
+
+            # Mode-2: bit-identity check. At alpha=0, V_used == V_sim exactly
+            # and both GAE passes should give identical advantages/returns.
+            ident = max(
+                float((mb_values - mb_values_sim).abs().max().item()),
+                float((mb_advs - mb_advs_sim).abs().max().item()),
+                float((mb_returns - mb_returns_sim).abs().max().item()),
+            )
+
+        self._rollout_diag = {
+            "residual/V_residual_norm_mean_sim": mean_sim,
+            "residual/V_residual_norm_mean_sim_minus_real": mean_sim - mean_real,
+            "residual/V_residual_norm_std_sim": std_sim,
+            "residual/frac_saturated": frac_sat,
+            "residual/advantage_shift_sim_raw": adv_shift_sim,
+            "residual/sigma": float(sigma.mean().item()),
+            "residual/sim_adv_sign_flip_frac": sign_flip_frac,
+            "debug/alpha0_value_identity_max": ident if alpha == 0.0 else 0.0,
+            "debug/value_identity_max_always": ident,
+        }
+
+    def _compute_rng_fingerprint(self) -> int:
+        """Small deterministic checksum of CPU + CUDA RNG state.
+
+        Used to detect non-bit-identity at alpha=0 between residual-mode and
+        baseline runs (Mode 2). A divergence at iter N versus a baseline run
+        before _step 1671 supports H_B (residual code perturbs the trajectory).
+        """
+        h = hashlib.blake2b(digest_size=8)
+        h.update(torch.get_rng_state().numpy().tobytes())
+        if torch.cuda.is_available():
+            h.update(torch.cuda.get_rng_state(self.ppo_device).numpy().tobytes())
+        # blake2b 8-byte digest fits in int64; cast to signed for TB-safe scalar.
+        return int.from_bytes(h.digest(), "little", signed=True)
+
+    def _install_actor_grad_leak_hook(self):
+        """Install backward hooks on actor params asserting no gradient flows
+        through them during the V_residual training step.
+
+        Returns (handles, leak_flag). Caller must remove handles after the
+        residual training step completes.
+        """
+        leak_flag = [False]
+
+        def _fire(_grad):
+            leak_flag[0] = True
+
+        handles = []
+        for p in self.model.parameters():
+            if p.requires_grad:
+                handles.append(p.register_hook(_fire))
+        return handles, leak_flag
+
+    def calc_gradients(self, input_dict):
+        """Override of A2CAgent.calc_gradients — verbatim except for the
+        ratio_extreme accumulator. Body must stay in sync with
+        a2c_continuous.py:79-180; resync if upstream changes.
+        """
+        value_preds_batch = input_dict["old_values"]
+        old_action_log_probs_batch = input_dict["old_logp_actions"]
+        advantage = input_dict["advantages"]
+        old_mu_batch = input_dict["mu"]
+        old_sigma_batch = input_dict["sigma"]
+        return_batch = input_dict["returns"]
+        actions_batch = input_dict["actions"]
+        obs_batch = input_dict["obs"]
+        obs_batch = self._preproc_obs(obs_batch)
+
+        lr_mul = 1.0
+        curr_e_clip = self.e_clip
+
+        batch_dict = {
+            "is_train": True,
+            "prev_actions": actions_batch,
+            "obs": obs_batch,
+        }
+
+        rnn_masks = None
+        if self.is_rnn:
+            rnn_masks = input_dict["rnn_masks"]
+            batch_dict["rnn_states"] = input_dict["rnn_states"]
+            batch_dict["seq_length"] = self.seq_length
+
+            if self.zero_rnn_on_done:
+                batch_dict["dones"] = input_dict["dones"]
+
+        with torch.amp.autocast(device_type="cuda", enabled=self.mixed_precision):
+            res_dict = self.model(batch_dict)
+            action_log_probs = res_dict["prev_neglogp"]
+            values = res_dict["values"]
+            entropy = res_dict["entropy"]
+            mu = res_dict["mus"]
+            sigma = res_dict["sigmas"]
+
+            # INSERT: ratio_extreme accumulator. action_log_probs is the
+            # current-policy neg-log-prob; old_action_log_probs_batch is the
+            # rollout's neg-log-prob. ratio = exp(old - new).
+            with torch.no_grad():
+                ratio = torch.exp(old_action_log_probs_batch - action_log_probs)
+                extreme = (ratio < 0.1) | (ratio > 10.0)
+                self._mb_ratio_extreme_count += int(extreme.sum().item())
+                self._mb_ratio_total += int(ratio.numel())
+
+            a_loss = self.actor_loss_func(
+                old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip
+            )
+
+            if self.has_value_loss:
+                c_loss = common_losses.critic_loss(
+                    self.model, value_preds_batch, values, curr_e_clip, return_batch, self.clip_value
+                )
+            else:
+                c_loss = torch.zeros(1, device=self.ppo_device)
+            if self.bound_loss_type == "regularisation":
+                b_loss = self.reg_loss(mu)
+            elif self.bound_loss_type == "bound":
+                b_loss = self.bound_loss(mu)
+            else:
+                b_loss = torch.zeros(1, device=self.ppo_device)
+            losses, sum_mask = torch_ext.apply_masks(
+                [a_loss.unsqueeze(1), c_loss, entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks
+            )
+            a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+
+            loss = (
+                a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+            )
+
+            if self.multi_gpu:
+                self.optimizer.zero_grad()
+            else:
+                for param in self.model.parameters():
+                    param.grad = None
+
+        self.scaler.scale(loss).backward()
+        self.trancate_gradients_and_step()
+
+        with torch.no_grad():
+            reduce_kl = rnn_masks is None
+            kl_dist = torch_ext.policy_kl(mu.detach(), sigma.detach(), old_mu_batch, old_sigma_batch, reduce_kl)
+            if rnn_masks is not None:
+                kl_dist = (kl_dist * rnn_masks).sum() / rnn_masks.numel()
+
+        self.diagnostics.mini_batch(
+            self,
+            {
+                "values": value_preds_batch,
+                "returns": return_batch,
+                "new_neglogp": action_log_probs,
+                "old_neglogp": old_action_log_probs_batch,
+                "masks": rnn_masks,
+            },
+            curr_e_clip,
+            0,
+        )
+
+        self.train_result = (
+            a_loss,
+            c_loss,
+            entropy,
+            kl_dist,
+            self.last_lr,
+            lr_mul,
+            mu.detach(),
+            sigma.detach(),
+            b_loss,
+        )
+
+    def trancate_gradients_and_step(self):
+        """Override of CommonAgent.trancate_gradients_and_step — verbatim
+        except that the return value of clip_grad_norm_ (pre-clip total norm)
+        is captured into self._mb_grad_norm_max. Resync if upstream changes
+        a2c_common.py:405-428.
+        """
+        if self.multi_gpu:
+            all_grads_list = []
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    all_grads_list.append(param.grad.view(-1))
+
+            all_grads = torch.cat(all_grads_list)
+            dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
+            offset = 0
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.data.copy_(
+                        all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.world_size
+                    )
+                    offset += param.numel()
+
+        if self.truncate_grads:
+            self.scaler.unscale_(self.optimizer)
+            pre_clip = nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+            self._record_grad_norm(pre_clip)
+        else:
+            # Compute pre-clip norm without applying clipping. Mirrors the
+            # behavior we'd get if truncate_grads were always True for metric.
+            self.scaler.unscale_(self.optimizer)
+            params_with_grad = [p for p in self.model.parameters() if p.grad is not None]
+            if params_with_grad:
+                norms = torch.stack([
+                    p.grad.detach().norm(2) for p in params_with_grad
+                ])
+                self._record_grad_norm(norms.norm(2))
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+    def _record_grad_norm(self, norm_tensor: torch.Tensor) -> None:
+        v = float(norm_tensor.item())
+        if not (v == v) or v == float("inf") or v == float("-inf"):
+            self._mb_grad_norm_nonfinite = True
+            return
+        if v > self._mb_grad_norm_max:
+            self._mb_grad_norm_max = v
 
 
 def apply_value_bootstrap_split(

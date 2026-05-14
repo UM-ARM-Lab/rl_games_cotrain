@@ -10,6 +10,7 @@ from rl_games.common import tr_helpers
 
 from rl_games.algos_torch import a2c_continuous
 from rl_games.algos_torch.a2c_residual_continuous import A2CResidualAgent
+from rl_games.algos_torch.a2c_loss_weight_continuous import A2CLossWeightAgent
 from rl_games.algos_torch import a2c_discrete
 from rl_games.algos_torch import players
 from rl_games.common.algo_observer import DefaultAlgoObserver
@@ -39,6 +40,10 @@ class Runner:
         self.algo_factory.register_builder(
             'a2c_residual_continuous',
             lambda **kwargs: A2CResidualAgent(**kwargs),
+        )
+        self.algo_factory.register_builder(
+            'a2c_loss_weight_continuous',
+            lambda **kwargs: A2CLossWeightAgent(**kwargs),
         )
         self.algo_factory.register_builder('a2c_discrete', lambda **kwargs : a2c_discrete.DiscreteA2CAgent(**kwargs))
         self.algo_factory.register_builder('sac', lambda **kwargs: sac_agent.SACAgent(**kwargs))

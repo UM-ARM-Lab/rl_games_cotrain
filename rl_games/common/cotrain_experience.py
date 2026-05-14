@@ -311,20 +311,26 @@ class RewScaleConsumer(ScoreConsumer):
             rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
 
 class LossWeightConsumer(ScoreConsumer):
-    """Reserved for a follow-up. Will pass per-cell weights into the PPO
-    surrogate / value loss directly. Spec section 'Open Questions' in
-    docs/superpowers/specs/2026-04-26-reward-modifying-scorer-design.md.
+    """post-GAE: write the scorer's binary (T, num_envs) acceptance mask into
+    td['loss_mask'] so A2CLossWeightAgent.calc_gradients can weight per-cell
+    PPO losses by it. Does not mutate rewards, returns, advantages, values,
+    or rows.
+
+    See docs/superpowers/specs/2026-05-13-loss-weight-cotrain-design.md.
     """
 
-    PHASE = "post_gae"  # placeholder; revisit in implementation
+    PHASE = "post_gae"
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "mod_method='loss_weight' is reserved for a follow-up — not yet implemented."
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        # weights is the per-cell binary {0,1} grid produced by
+        # ChunkScorer.paint_weights in binary scoring_mode. Real-env columns
+        # and outside-window sim cells are 1.0 by construction.
+        loss_mask = td.get("loss_mask")
+        assert loss_mask is not None, (
+            "td['loss_mask'] must be preallocated by CotrainExperienceBuffer "
+            "when loss_weight_enabled=True"
         )
-
-    def apply(self, td, weights):  # pragma: no cover
-        raise NotImplementedError
+        loss_mask.copy_(weights.detach().to(loss_mask.dtype))
 
 
 class CotrainExperienceBuffer:
@@ -359,6 +365,7 @@ class CotrainExperienceBuffer:
         mod_cfg: Optional[dict] = None,
         writer=None,
         residual_enabled: bool = False,
+        loss_weight_enabled: bool = False,
         real_env_idx: Optional[torch.Tensor] = None,
     ):
         """
@@ -405,22 +412,40 @@ class CotrainExperienceBuffer:
         self._log_step = 0
 
         self.residual_enabled = bool(residual_enabled)
+        # loss_weight mode self-enables: if the user picked mod_method='loss_weight'
+        # they need is_real/loss_mask preallocated, so flip the flag on regardless
+        # of the constructor arg. The flag stays for explicit callers / tests.
+        self.loss_weight_enabled = bool(loss_weight_enabled) or (mod_method == "loss_weight")
         self.real_env_idx = (
             real_env_idx.to(device).long()
             if real_env_idx is not None else None
         )
 
+        T = algo_info["horizon_length"]
+        N = algo_info["num_actors"]
+        value_size = env_info.get("value_size", 1)
+        td = self.buffer.tensor_dict
+
         if self.residual_enabled:
             assert self.real_env_idx is not None, (
                 "residual_enabled=True requires real_env_idx (1-D LongTensor)"
             )
-            T = algo_info["horizon_length"]
-            N = algo_info["num_actors"]
-            value_size = env_info.get("value_size", 1)
-            td = self.buffer.tensor_dict
             td["values_sim"] = torch.zeros(T, N, value_size, device=device)
             td["residual_values_norm"] = torch.zeros(T, N, value_size, device=device)
             td["rewards_sim"] = torch.zeros(T, N, value_size, device=device)
+
+        if self.loss_weight_enabled:
+            assert self.real_env_idx is not None, (
+                "loss_weight_enabled=True requires real_env_idx (1-D LongTensor)"
+            )
+            # loss_mask defaults to ones so a no-op rollout (no scorer or no
+            # valid chunks) trains every cell. The LossWeightConsumer copies
+            # the (T, N) scorer weights into this buffer post-GAE.
+            td["loss_mask"] = torch.ones(T, N, device=device)
+
+        # is_real is shared by residual and loss_weight modes — allocate once
+        # if either is enabled.
+        if self.residual_enabled or self.loss_weight_enabled:
             td["is_real"] = torch.zeros(T, N, dtype=torch.bool, device=device)
 
         self.scoring_mode = scoring_mode
@@ -511,7 +536,10 @@ class CotrainExperienceBuffer:
                 reward_floor=self.mod_cfg["reward_floor"], reward_keys=keys,
             )
         elif mod_method == "loss_weight":
-            self._consumer = LossWeightConsumer()  # raises NotImplementedError
+            assert scoring_mode == "binary", (
+                f"mod_method='loss_weight' requires scoring_mode='binary', got {scoring_mode!r}"
+            )
+            self._consumer = LossWeightConsumer()
         else:
             raise ValueError(
                 f"unknown mod_method={mod_method!r}; "
@@ -538,10 +566,13 @@ class CotrainExperienceBuffer:
     def paint_is_real(self) -> None:
         """Set is_real[:, real_env_idx] = True. Called once per rollout from
         play_steps; column-pure pre-resample, but FilterConsumer may shuffle
-        rows so post-resample is_real is per-cell (see spec §6.2)."""
-        if not self.residual_enabled:
+        rows so post-resample is_real is per-cell.
+
+        Fires whenever is_real has been preallocated by either residual_enabled
+        or loss_weight_enabled."""
+        is_real = self.buffer.tensor_dict.get("is_real")
+        if is_real is None:
             return
-        is_real = self.buffer.tensor_dict["is_real"]
         is_real.zero_()
         is_real[:, self.real_env_idx] = True
 

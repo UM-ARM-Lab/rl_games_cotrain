@@ -29,11 +29,13 @@ def _merge_gae_dones_override(mb_fdones, fdones, override):
     `override[t, env] = True` means cell (t, env) should be treated as a
     synthetic terminal in GAE — i.e. nextnonterminal at step t must be 0.
     Since discount_values reads nextnonterminal at step t from mb_fdones[t+1]
-    (or fdones when t == T-1), we shift override left by 1 along the time
-    axis and OR it into mb_fdones, with the last row OR'd into fdones.
+    (or fdones when t == T-1), we shift override forward by 1 along the time
+    axis (mb_fdones[k] |= override[k-1] for k>=1) and OR the last row into
+    fdones.
 
-    Returns (mb_fdones_out, fdones_out). If override is None, the inputs are
-    returned unchanged (identity, not copied).
+    Returns (mb_fdones_out, fdones_out). Does not mutate `mb_fdones`, `fdones`,
+    or `override` in place. If override is None, the inputs are returned
+    unchanged (identity, not copied).
     """
     if override is None:
         return mb_fdones, fdones

@@ -310,6 +310,7 @@ class RewScaleConsumer(ScoreConsumer):
             scale = weights.unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
             rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
 
+
 class RejectTerminalConsumer(ScoreConsumer):
     """pre-GAE: treat rejected cells as synthetic terminals with zero terminal value.
 

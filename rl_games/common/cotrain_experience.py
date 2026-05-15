@@ -355,7 +355,10 @@ class RejectTerminalConsumer(ScoreConsumer):
             "RejectTerminalConsumer requires td['gae_dones_override'] to be "
             "preallocated by CotrainExperienceBuffer (mod_method='reject_terminal')"
         )
-        override.copy_(override | reject_2d.to(override.dtype))
+        # Overwrite rather than OR: the buffer preallocates this tensor once
+        # and reuses it across rollouts. ORing would accumulate True bits over
+        # iterations and eventually mark every cell as a synthetic terminal.
+        override.copy_(reject_2d.to(override.dtype))
 
 
 class LossWeightConsumer(ScoreConsumer):

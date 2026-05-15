@@ -23,6 +23,31 @@ from rl_games.common.interval_summary_writer import IntervalSummaryWriter
 from rl_games.interfaces.base_algorithm import BaseAlgorithm
 
 
+def _merge_gae_dones_override(mb_fdones, fdones, override):
+    """OR a per-cell 'synthetic terminal' override into the GAE dones tensors.
+
+    `override[t, env] = True` means cell (t, env) should be treated as a
+    synthetic terminal in GAE — i.e. nextnonterminal at step t must be 0.
+    Since discount_values reads nextnonterminal at step t from mb_fdones[t+1]
+    (or fdones when t == T-1), we shift override left by 1 along the time
+    axis and OR it into mb_fdones, with the last row OR'd into fdones.
+
+    Returns (mb_fdones_out, fdones_out). If override is None, the inputs are
+    returned unchanged (identity, not copied).
+    """
+    if override is None:
+        return mb_fdones, fdones
+    ovr = override.to(mb_fdones.dtype)
+    T = mb_fdones.shape[0]
+    # mb_fdones[k] |= override[k-1] for k in [1, T)
+    shifted = torch.zeros_like(mb_fdones)
+    if T >= 2:
+        shifted[1:] = ovr[:-1]
+    mb_fdones_out = torch.maximum(mb_fdones, shifted)
+    fdones_out = torch.maximum(fdones, ovr[-1])
+    return mb_fdones_out, fdones_out
+
+
 def swap_and_flatten01(arr):
     """
     swap and then flatten axes 0 and 1
@@ -948,10 +973,18 @@ class A2CBase(BaseAlgorithm):
         mb_rewards = self.experience_buffer.tensor_dict["rewards"]
         mb_masks = self.experience_buffer.tensor_dict.get("mask", None)
 
-        # mod_method=rew_low/rew_sub mutates mb_rewards in-place here so GAE
-        # propagates the penalty backward. mod_method=filter is a no-op.
+        # mod_method=rew_low/rew_sub/reject_terminal mutates mb_rewards (and,
+        # for reject_terminal, paints td['gae_dones_override']) in-place here
+        # so GAE propagates the modification backward.
         if self.cotrain_enabled:
             self.experience_buffer.apply_pre_gae(self.experience_buffer.tensor_dict)
+
+        # mod_method=reject_terminal: shift the override grid by +1 along time
+        # and OR into mb_fdones / fdones so discount_values sees the rejected
+        # cells as synthetic terminals with zero terminal value. td['dones']
+        # stays untouched.
+        override = self.experience_buffer.tensor_dict.get("gae_dones_override")
+        mb_fdones, fdones = _merge_gae_dones_override(mb_fdones, fdones, override)
 
         if mb_masks is not None:
             mb_advs = self.discount_values_masks(
@@ -1076,10 +1109,18 @@ class A2CBase(BaseAlgorithm):
         mb_rewards = self.experience_buffer.tensor_dict["rewards"]
         mb_masks = self.experience_buffer.tensor_dict.get("mask", None)
 
-        # mod_method=rew_low/rew_sub mutates mb_rewards in-place here so GAE
-        # propagates the penalty backward. mod_method=filter is a no-op.
+        # mod_method=rew_low/rew_sub/reject_terminal mutates mb_rewards (and,
+        # for reject_terminal, paints td['gae_dones_override']) in-place here
+        # so GAE propagates the modification backward.
         if self.cotrain_enabled:
             self.experience_buffer.apply_pre_gae(self.experience_buffer.tensor_dict)
+
+        # mod_method=reject_terminal: shift the override grid by +1 along time
+        # and OR into mb_fdones / fdones so discount_values sees the rejected
+        # cells as synthetic terminals with zero terminal value. td['dones']
+        # stays untouched.
+        override = self.experience_buffer.tensor_dict.get("gae_dones_override")
+        mb_fdones, fdones = _merge_gae_dones_override(mb_fdones, fdones, override)
 
         if mb_masks is not None:
             mb_advs = self.discount_values_masks(

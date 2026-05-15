@@ -310,6 +310,53 @@ class RewScaleConsumer(ScoreConsumer):
             scale = weights.unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
             rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
 
+class RejectTerminalConsumer(ScoreConsumer):
+    """pre-GAE: treat rejected cells as synthetic terminals with zero terminal value.
+
+    Writes two pieces of state on cells where weight == 0.0:
+      (a) td[reward_keys] := reward_floor — zeros the immediate reward by default.
+      (b) td['gae_dones_override'] := True — signals discount_values() to set
+          nextnonterminal=0 at that cell, killing both the gamma*V(s_{t+1})
+          bootstrap and the gamma*lambda*lastgaelam propagation. The net effect
+          is R_t = 0 and A_t = -V(s_t), which supervises the critic toward
+          V(s_t) -> 0 on rejected states. The zero return-to-go then propagates
+          one GAE step backward naturally on subsequent updates.
+
+    Sign convention: reward_floor is the reward value written on rejected cells.
+    Default 0.0 (the canonical "no credit for penetration" target). Negative
+    values stack an active penalty on top of the synthetic-terminal effect.
+
+    Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
+    construction. In residual mode the buffer passes
+    ``reward_keys=['rewards', 'rewards_sim']`` so both streams get floored
+    symmetrically; the default keeps backward compat.
+
+    Does NOT mutate td['dones'] — env-reset bookkeeping, RNN masks, and
+    game-length tracking read from td['dones'] and must remain unaffected.
+    """
+
+    PHASE = "pre_gae"
+
+    def __init__(self, reward_floor: float = 0.0, reward_keys: Optional[list] = None):
+        self.reward_floor = float(reward_floor)
+        self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
+
+    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+        reject_2d = (weights == 0.0)  # (T, N) bool
+        for key in self.reward_keys:
+            if key not in td:
+                continue
+            rewards = td[key]                                            # (T, N, value_size)
+            reject = reject_2d.unsqueeze(-1).expand_as(rewards)
+            rewards[reject] = self.reward_floor
+        override = td.get("gae_dones_override")
+        assert override is not None, (
+            "RejectTerminalConsumer requires td['gae_dones_override'] to be "
+            "preallocated by CotrainExperienceBuffer (mod_method='reject_terminal')"
+        )
+        override.copy_(override | reject_2d.to(override.dtype))
+
+
 class LossWeightConsumer(ScoreConsumer):
     """post-GAE: write the scorer's binary (T, num_envs) acceptance mask into
     td['loss_mask'] so A2CLossWeightAgent.calc_gradients can weight per-cell

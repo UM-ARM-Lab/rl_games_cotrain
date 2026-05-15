@@ -496,6 +496,14 @@ class CotrainExperienceBuffer:
         if self.residual_enabled or self.loss_weight_enabled:
             td["is_real"] = torch.zeros(T, N, dtype=torch.bool, device=device)
 
+        # Synthetic-terminal override grid for mod_method='reject_terminal'.
+        # The pre-GAE consumer paints True at cells whose return-to-go must be
+        # zeroed; a2c_common.play_steps reads this grid and ORs the shifted
+        # mask into mb_fdones/fdones inside discount_values() only — the real
+        # td['dones'] tensor stays untouched.
+        if mod_method == "reject_terminal":
+            td["gae_dones_override"] = torch.zeros(T, N, dtype=torch.bool, device=device)
+
         self.scoring_mode = scoring_mode
 
         self.plot_dir = plot_dir
@@ -504,7 +512,7 @@ class CotrainExperienceBuffer:
 
         # Validate mod_method / scoring_mode compatibility early — before
         # ChunkScorer is constructed — so the assertion message is actionable.
-        if mod_method in ("rew_low", "rew_sub"):
+        if mod_method in ("rew_low", "rew_sub", "reject_terminal"):
             assert scoring_mode == "binary", (
                 f"mod_method={mod_method!r} requires scoring_mode='binary', got {scoring_mode!r}"
             )
@@ -583,6 +591,15 @@ class CotrainExperienceBuffer:
             self._consumer = RewScaleConsumer(
                 reward_floor=self.mod_cfg["reward_floor"], reward_keys=keys,
             )
+        elif mod_method == "reject_terminal":
+            assert scoring_mode == "binary", (
+                f"mod_method='reject_terminal' requires scoring_mode='binary', got {scoring_mode!r}"
+            )
+            reward_floor = float(self.mod_cfg.get("reward_floor", 0.0))
+            keys = ["rewards", "rewards_sim"] if self.residual_enabled else ["rewards"]
+            self._consumer = RejectTerminalConsumer(
+                reward_floor=reward_floor, reward_keys=keys,
+            )
         elif mod_method == "loss_weight":
             assert scoring_mode == "binary", (
                 f"mod_method='loss_weight' requires scoring_mode='binary', got {scoring_mode!r}"
@@ -591,7 +608,8 @@ class CotrainExperienceBuffer:
         else:
             raise ValueError(
                 f"unknown mod_method={mod_method!r}; "
-                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_scale', 'loss_weight'"
+                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_scale', "
+                f"'reject_terminal', 'loss_weight'"
             )
 
     @property

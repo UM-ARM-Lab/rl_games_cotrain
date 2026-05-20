@@ -383,6 +383,62 @@ class RewSubScaleConsumer(ScoreConsumer):
             rewards.sub_(penalty.unsqueeze(-1).to(rewards.dtype))
 
 
+
+class RejectTerminalConsumer(ScoreConsumer):
+    """pre-GAE: treat rejected cells as synthetic terminals with zero terminal value.
+
+    Writes two pieces of state on cells where weight == 0.0:
+      (a) td[reward_keys] := reward_floor — zeros the immediate reward by default.
+      (b) td['gae_dones_override'] := True — signals discount_values() to set
+          nextnonterminal=0 at that cell, killing both the gamma*V(s_{t+1})
+          bootstrap and the gamma*lambda*lastgaelam propagation. The net effect
+          is R_t = 0 and A_t = -V(s_t), which supervises the critic toward
+          V(s_t) -> 0 on rejected states. The zero return-to-go then propagates
+          one GAE step backward naturally on subsequent updates.
+
+    Sign convention: reward_floor is the reward value written on rejected cells.
+    Default 0.0 (the canonical "no credit for penetration" target). Negative
+    values stack an active penalty on top of the synthetic-terminal effect.
+
+    Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
+    construction. In residual mode the buffer passes
+    ``reward_keys=['rewards', 'rewards_sim']`` so both streams get floored
+    symmetrically; the default keeps backward compat.
+
+    Does NOT mutate td['dones'] — env-reset bookkeeping, RNN masks, and
+    game-length tracking read from td['dones'] and must remain unaffected.
+    """
+
+    PHASE = "pre_gae"
+
+    def __init__(self, reward_floor: float = 0.0, reward_keys: Optional[list] = None):
+        self.reward_floor = float(reward_floor)
+        self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
+
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
+        reject_2d = (weights == 0.0)  # (T, N) bool
+        for key in self.reward_keys:
+            if key not in td:
+                continue
+            rewards = td[key]                                            # (T, N, value_size)
+            reject = reject_2d.unsqueeze(-1).expand_as(rewards)
+            rewards[reject] = self.reward_floor
+        override = td.get("gae_dones_override")
+        assert override is not None, (
+            "RejectTerminalConsumer requires td['gae_dones_override'] to be "
+            "preallocated by CotrainExperienceBuffer (mod_method='reject_terminal')"
+        )
+        # Overwrite rather than OR: the buffer preallocates this tensor once
+        # and reuses it across rollouts. ORing would accumulate True bits over
+        # iterations and eventually mark every cell as a synthetic terminal.
+        override.copy_(reject_2d.to(override.dtype))
+
+
 class LossWeightConsumer(ScoreConsumer):
     """post-GAE: write the scorer's binary (T, num_envs) acceptance mask into
     td['loss_mask'] so A2CLossWeightAgent.calc_gradients can weight per-cell
@@ -531,6 +587,14 @@ class CotrainExperienceBuffer:
         if self.residual_enabled or self.loss_weight_enabled:
             td["is_real"] = torch.zeros(T, N, dtype=torch.bool, device=device)
 
+        # Synthetic-terminal override grid for mod_method='reject_terminal'.
+        # The pre-GAE consumer paints True at cells whose return-to-go must be
+        # zeroed; a2c_common.play_steps reads this grid and ORs the shifted
+        # mask into mb_fdones/fdones inside discount_values() only — the real
+        # td['dones'] tensor stays untouched.
+        if mod_method == "reject_terminal":
+            td["gae_dones_override"] = torch.zeros(T, N, dtype=torch.bool, device=device)
+
         self.scoring_mode = scoring_mode
 
         self.plot_dir = plot_dir
@@ -539,7 +603,7 @@ class CotrainExperienceBuffer:
 
         # Validate mod_method / scoring_mode compatibility early — before
         # ChunkScorer is constructed — so the assertion message is actionable.
-        if mod_method in ("rew_low", "rew_sub", "rew_sub_scale"):
+        if mod_method in ("rew_low", "rew_sub", "rew_sub_scale", "reject_terminal"):
             assert scoring_mode == "binary", (
                 f"mod_method={mod_method!r} requires scoring_mode='binary', got {scoring_mode!r}"
             )
@@ -620,6 +684,15 @@ class CotrainExperienceBuffer:
             self._consumer = RewSubScaleConsumer(
                 M=self.mod_cfg["M"], K=self.mod_cfg["K"], B=B, reward_keys=keys,
             )
+        elif mod_method == "reject_terminal":
+            assert scoring_mode == "binary", (
+                f"mod_method='reject_terminal' requires scoring_mode='binary', got {scoring_mode!r}"
+            )
+            reward_floor = float(self.mod_cfg.get("reward_floor", 0.0))
+            keys = ["rewards", "rewards_sim"] if self.residual_enabled else ["rewards"]
+            self._consumer = RejectTerminalConsumer(
+                reward_floor=reward_floor, reward_keys=keys,
+            )
         elif mod_method == "loss_weight":
             assert scoring_mode == "binary", (
                 f"mod_method='loss_weight' requires scoring_mode='binary', got {scoring_mode!r}"
@@ -628,7 +701,8 @@ class CotrainExperienceBuffer:
         else:
             raise ValueError(
                 f"unknown mod_method={mod_method!r}; "
-                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_sub_scale', 'loss_weight'"
+                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_sub_scale', "
+                f"'reject_terminal', 'loss_weight'"
             )
 
     @property

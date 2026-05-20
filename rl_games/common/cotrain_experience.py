@@ -122,6 +122,23 @@ class ChunkScorer:
             sim_w[t + H:t + H + F] = chunk_weight[i].unsqueeze(0).expand(F, -1)
         return sim_w
 
+    def paint_scores(self, scores, chunk_starts, T, N, fill_value=float("nan")):
+        """Build (T, N) per-timestep raw-score grid from per-chunk scores.
+
+        Mirrors ``paint_weights`` but writes the raw scorer output (not the
+        per-mode weight) onto cells [t+H : t+H+F) for each chunk start t.
+        Cells outside any chunk's future window are filled with ``fill_value``
+        (NaN by default) so consumers can detect non-scored cells via isnan.
+        """
+        out = torch.full((T, N), fill_value, device=self.device, dtype=torch.float32)
+        if scores is None:
+            return out
+        F = self.future_horizon
+        H = self.horizon
+        for i, t in enumerate(chunk_starts):
+            out[t + H:t + H + F] = scores[i].unsqueeze(0).expand(F, -1)
+        return out
+
     def _chunk_weight_binary(self, scores):
         if self.score_direction == "le":
             return (scores <= self.threshold).float()
@@ -181,17 +198,31 @@ class ScoreConsumer(ABC):
                      propagate through GAE.
         "post_gae" — runs after returns are computed so row permutations
                      preserve (returns, values, advantages) row-alignment.
+
+    NEEDS_SCORES:
+        Opt-in flag. When True, the buffer also paints the raw (T, num_envs)
+        score grid (NaN outside any chunk window) and passes it to `apply`
+        via the `scores_grid` kwarg. Consumers that only need the binary
+        weight mask leave this False and ignore the kwarg.
     """
 
     PHASE: str = ""
+    NEEDS_SCORES: bool = False
 
     @abstractmethod
-    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
-        """Mutate `td` in-place using the (T, num_envs) weight grid.
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Mutate `td` in-place using the (T, num_envs) weight grid (and
+        optionally a raw-score grid).
 
-        Real-env columns and outside-window cells are 1.0 by construction, so
-        consumers never need a sim_env_idx — the weight==0 mask already only
-        fires on rejected scored cells.
+        Real-env columns and outside-window cells are 1.0 by construction in
+        `weights`, so consumers never need a sim_env_idx — the weight==0 mask
+        already only fires on rejected scored cells. `scores_grid`, when
+        passed, holds the raw scorer output on scored cells and NaN elsewhere.
         """
 
 
@@ -204,7 +235,12 @@ class FilterConsumer(ScoreConsumer):
     def __init__(self, chunk_scorer: "ChunkScorer"):
         self._chunk_scorer = chunk_scorer
 
-    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
         T = weights.shape[0]
         num_envs = weights.shape[1]
         flat_w = weights.reshape(-1)
@@ -237,7 +273,12 @@ class RewLowConsumer(ScoreConsumer):
         self.reward_floor = float(reward_floor)
         self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
 
-    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
         for key in self.reward_keys:
             if key not in td:
                 continue
@@ -263,7 +304,12 @@ class RewSubConsumer(ScoreConsumer):
         self.reward_subtract = float(reward_subtract)
         self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
 
-    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
         for key in self.reward_keys:
             if key not in td:
                 continue
@@ -272,43 +318,70 @@ class RewSubConsumer(ScoreConsumer):
             rewards.sub_(reject * self.reward_subtract)
 
 
-class RewScaleConsumer(ScoreConsumer):
-    """pre-GAE: blend td['rewards'] toward `reward_floor` based on per-cell weights.
+class RewSubScaleConsumer(ScoreConsumer):
+    """pre-GAE: subtract a score-quadratic penalty from td[reward_keys] on
+    scored sim cells whose raw score is at or below zero.
 
-    Operation:  r' = w * r + (1 - w) * reward_floor
+    Penalty:  P(s) = M + K * (s - B)^2
+    Applied:  rewards[t, j] -= P(s[t, j])   iff scored AND s[t, j] <= 0
 
-    With `scoring_mode='softmax'`, weights are exp(-score / temperature) ∈ (0, 1]
-    for MSE scores ≥ 0. Bad-prediction chunks (small w) get rewards pulled toward
-    `reward_floor`; good chunks (w → 1) keep their original rewards.
+    Convention is SDF-shaped: ``s`` is the raw scorer output (e.g. aggregated
+    SDF clearance, positive = above surface, non-positive = at/in contact).
+    Cells with s > 0 (clearance) and cells the scorer didn't touch (real-env
+    columns and outside-window sim cells, marked NaN in scores_grid) are
+    untouched.
 
-    Real-env cells and outside-window cells have w = 1.0 by construction, so
-    rewards there are untouched.
+    The quadratic is centered at ``B`` (default -0.0029 m, matching the
+    deepest penetration seen in expert-successful trajectories). Penalty is
+    minimal at s = B and grows symmetrically away from it; the s >= 0 gate
+    cuts off the shallow-side growth past the surface.
 
-    Sign-aware by design: works correctly for negative rewards (penalties get
-    deepened toward the floor instead of shrunk toward zero).
-
-    Binary scoring degenerates to RewLowConsumer with the same floor; the
-    buffer asserts scoring_mode='softmax' at construction to keep the contract
-    distinct.
+    Binary-only by contract — the buffer asserts scoring_mode == 'binary' at
+    construction. In residual mode the buffer passes
+    ``reward_keys=['rewards', 'rewards_sim']`` so both streams are penalized
+    symmetrically; the default keeps backward compat.
     """
 
     PHASE = "pre_gae"
+    NEEDS_SCORES = True
 
-    def __init__(self, reward_floor: float, reward_keys: Optional[list] = None):
-        self.reward_floor = float(reward_floor)
+    def __init__(
+        self,
+        M: float,
+        K: float,
+        B: float = -0.0029,
+        reward_keys: Optional[list] = None,
+    ):
+        self.M = float(M)
+        self.K = float(K)
+        self.B = float(B)
         self.reward_keys = list(reward_keys) if reward_keys else ["rewards"]
 
-    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
+        assert scores_grid is not None, (
+            "RewSubScaleConsumer requires scores_grid; the buffer must paint "
+            "it when consumer.NEEDS_SCORES=True"
+        )
+        scored = ~torch.isnan(scores_grid)
+        penalize = scored & (scores_grid <= 0.0)
+        diff = scores_grid - self.B
+        penalty = self.M + self.K * diff * diff
+        penalty = torch.where(penalize, penalty, torch.zeros_like(penalty))
         for key in self.reward_keys:
             if key not in td:
                 continue
-            rewards = td[key]                                            # (T, N, value_size)
-            assert weights.shape == rewards.shape[:2], (
-                f"weights shape {tuple(weights.shape)} must match rewards "
+            rewards = td[key]                                                  # (T, N, value_size)
+            assert penalty.shape == rewards.shape[:2], (
+                f"scores_grid shape {tuple(penalty.shape)} must match rewards "
                 f"shape[:2] {tuple(rewards.shape[:2])}"
             )
-            scale = weights.unsqueeze(-1).expand_as(rewards).to(rewards.dtype)
-            rewards.copy_(scale * rewards + (1.0 - scale) * self.reward_floor)
+            rewards.sub_(penalty.unsqueeze(-1).to(rewards.dtype))
+
 
 class LossWeightConsumer(ScoreConsumer):
     """post-GAE: write the scorer's binary (T, num_envs) acceptance mask into
@@ -321,7 +394,12 @@ class LossWeightConsumer(ScoreConsumer):
 
     PHASE = "post_gae"
 
-    def apply(self, td: Dict[str, torch.Tensor], weights: torch.Tensor) -> None:
+    def apply(
+        self,
+        td: Dict[str, torch.Tensor],
+        weights: torch.Tensor,
+        scores_grid: Optional[torch.Tensor] = None,
+    ) -> None:
         # weights is the per-cell binary {0,1} grid produced by
         # ChunkScorer.paint_weights in binary scoring_mode. Real-env columns
         # and outside-window sim cells are 1.0 by construction.
@@ -401,9 +479,14 @@ class CotrainExperienceBuffer:
             mod_method: How to consume the per-cell weight grid. "filter"
                 (default) resamples buffer rows post-GAE. "rew_low" floors
                 rewards on rejected cells pre-GAE. "rew_sub" subtracts a
-                penalty pre-GAE. "loss_weight" is reserved.
+                fixed penalty pre-GAE. "rew_sub_scale" subtracts a
+                score-quadratic penalty M+K*(s-B)^2 on scored cells with
+                s < 0. "loss_weight" zeroes the critic loss on rejected sim
+                cells (post-GAE; requires A2CLossWeightAgent).
             mod_cfg: Config dict for the selected mod_method. Required keys
-                vary by method (e.g. "reward_floor" for "rew_low").
+                vary by method (e.g. "reward_floor" for "rew_low",
+                {"M", "K"} for "rew_sub_scale", optional "B" defaults to
+                -0.0029).
             writer: Optional tensorboard SummaryWriter for logging.
         """
         self.buffer = ExperienceBuffer(env_info, algo_info, device)
@@ -456,7 +539,7 @@ class CotrainExperienceBuffer:
 
         # Validate mod_method / scoring_mode compatibility early — before
         # ChunkScorer is constructed — so the assertion message is actionable.
-        if mod_method in ("rew_low", "rew_sub"):
+        if mod_method in ("rew_low", "rew_sub", "rew_sub_scale"):
             assert scoring_mode == "binary", (
                 f"mod_method={mod_method!r} requires scoring_mode='binary', got {scoring_mode!r}"
             )
@@ -493,7 +576,9 @@ class CotrainExperienceBuffer:
         # Selects what to do with the per-cell weight grid produced above.
         # `filter` (default) reproduces today's resample-by-weight behavior.
         # `rew_low` / `rew_sub` overwrite/penalize td['rewards'] on weight==0
-        # cells (binary scoring only). `loss_weight` is reserved.
+        # cells (binary scoring only). `rew_sub_scale` subtracts a
+        # score-quadratic penalty on scored cells with raw score < 0.
+        # `loss_weight` masks the critic loss post-GAE.
         self.mod_method = mod_method
         self.mod_cfg = dict(mod_cfg) if mod_cfg else {}
 
@@ -523,17 +608,17 @@ class CotrainExperienceBuffer:
             self._consumer = RewSubConsumer(
                 reward_subtract=self.mod_cfg["reward_subtract"], reward_keys=keys,
             )
-        elif mod_method == "rew_scale":
-            assert scoring_mode == "softmax", (
-                f"mod_method='rew_scale' requires scoring_mode='softmax' "
-                f"(use rew_low for the binary case), got {scoring_mode!r}"
+        elif mod_method == "rew_sub_scale":
+            assert scoring_mode == "binary", (
+                f"mod_method='rew_sub_scale' requires scoring_mode='binary', got {scoring_mode!r}"
             )
-            assert "reward_floor" in self.mod_cfg, (
-                "mod_method='rew_scale' requires mod_cfg['reward_floor']"
+            assert "M" in self.mod_cfg and "K" in self.mod_cfg, (
+                "mod_method='rew_sub_scale' requires mod_cfg['M'] and mod_cfg['K']"
             )
+            B = float(self.mod_cfg.get("B", -0.0029))
             keys = ["rewards", "rewards_sim"] if self.residual_enabled else ["rewards"]
-            self._consumer = RewScaleConsumer(
-                reward_floor=self.mod_cfg["reward_floor"], reward_keys=keys,
+            self._consumer = RewSubScaleConsumer(
+                M=self.mod_cfg["M"], K=self.mod_cfg["K"], B=B, reward_keys=keys,
             )
         elif mod_method == "loss_weight":
             assert scoring_mode == "binary", (
@@ -543,7 +628,7 @@ class CotrainExperienceBuffer:
         else:
             raise ValueError(
                 f"unknown mod_method={mod_method!r}; "
-                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_scale', 'loss_weight'"
+                f"expected one of 'filter', 'rew_low', 'rew_sub', 'rew_sub_scale', 'loss_weight'"
             )
 
     @property
@@ -586,7 +671,8 @@ class CotrainExperienceBuffer:
 
     def apply_pre_gae(self, td: dict) -> None:
         """Hook invoked by a2c_common BEFORE discount_values(). No-op unless
-        the configured ScoreConsumer's PHASE is 'pre_gae' (i.e. rew_low/rew_sub).
+        the configured ScoreConsumer's PHASE is 'pre_gae' (i.e. rew_low /
+        rew_sub / rew_sub_scale).
 
         Mutates td['rewards'] in-place when active, so subsequent GAE sees the
         modified rewards.
@@ -595,10 +681,10 @@ class CotrainExperienceBuffer:
             return
         if self._consumer.PHASE != "pre_gae":
             return
-        scores, chunk_starts, weights = self._score_and_paint(td)
+        scores, chunk_starts, weights, scores_grid = self._score_and_paint(td)
         if weights is None:
             return
-        self._consumer.apply(td, weights)
+        self._consumer.apply(td, weights, scores_grid=scores_grid)
         self._print_acceptance_ratio(scores)
         self._log_scoring_stats(weights)
         # self._maybe_save_resample_plot(td, scores, chunk_starts)
@@ -622,10 +708,10 @@ class CotrainExperienceBuffer:
             return rnn_states_raw
         if td is None:
             td = self.buffer.tensor_dict
-        scores, chunk_starts, weights = self._score_and_paint(td)
+        scores, chunk_starts, weights, scores_grid = self._score_and_paint(td)
         if weights is None:
             return rnn_states_raw
-        self._consumer.apply(td, weights)
+        self._consumer.apply(td, weights, scores_grid=scores_grid)
         self._print_acceptance_ratio(scores)
         self._log_scoring_stats(weights)
         # self._maybe_save_resample_plot(td, scores, chunk_starts)
@@ -645,20 +731,28 @@ class CotrainExperienceBuffer:
         print(f"[Cotrain] sim acceptance ratio ({cmp_str}): {accept_ratio:.4f}")
 
     def _score_and_paint(self, td: dict):
-        """Score sim chunks and paint full (T, num_envs) weight grid.
+        """Score sim chunks and paint full (T, num_envs) weight grid (and,
+        if the active consumer opts in via NEEDS_SCORES, a parallel raw-score
+        grid with NaN sentinels for non-scored cells).
 
-        Returns (scores, chunk_starts, weights). Returns (None, [], None)
-        when T is too short for any valid chunk.
+        Returns (scores, chunk_starts, weights, scores_grid). Returns
+        (None, [], None, None) when T is too short for any valid chunk.
+        ``scores_grid`` is None when the consumer doesn't need raw scores.
         """
         T = td["dones"].shape[0]
         num_envs = td["dones"].shape[1]
         scores, chunk_starts = self._score_sim_chunks(td, T)
         if scores is None:
-            return None, [], None
+            return None, [], None, None
         weights = self._build_scoring_weights_from_scores(
             scores, chunk_starts, T, num_envs,
         )
-        return scores, chunk_starts, weights
+        scores_grid = None
+        if self._consumer is not None and self._consumer.NEEDS_SCORES:
+            scores_grid = self._build_scores_grid_from_scores(
+                scores, chunk_starts, T, num_envs,
+            )
+        return scores, chunk_starts, weights, scores_grid
 
     # ------------------------------------------------------------------
     # Weight construction (one method per mode, dispatched by scoring_mode)
@@ -683,6 +777,26 @@ class CotrainExperienceBuffer:
         sim_w = self._chunk_scorer.paint_weights(scores, chunk_starts, T, num_sim)
         weights[:, self.sim_env_idx] = sim_w
         return weights
+
+    def _build_scores_grid_from_scores(
+        self,
+        scores: Optional[torch.Tensor],
+        chunk_starts: list,
+        T: int,
+        num_envs: int,
+    ) -> torch.Tensor:
+        """Build (T, num_envs) raw-score grid. Real envs and outside-window
+        sim cells are NaN; scored sim chunks hold their raw score on cells
+        [t+H : t+H+F)."""
+        scores_grid = torch.full(
+            (T, num_envs), float("nan"), device=self.device, dtype=torch.float32,
+        )
+        num_sim = int(self.sim_env_idx.numel())
+        if num_sim == 0 or scores is None:
+            return scores_grid
+        sim_s = self._chunk_scorer.paint_scores(scores, chunk_starts, T, num_sim)
+        scores_grid[:, self.sim_env_idx] = sim_s
+        return scores_grid
 
     def _score_sim_chunks(self, td: dict, T: int):
         """Extract sim-env chunks, run the scorer, return (scores, chunk_starts)."""

@@ -51,6 +51,7 @@ class Runner:
 
         self.player_factory = object_factory.ObjectFactory()
         self.player_factory.register_builder('a2c_continuous', lambda **kwargs : players.PpoPlayerContinuous(**kwargs))
+        self.player_factory.register_builder('a2c_loss_weight_continuous', lambda **kwargs : players.PpoPlayerContinuous(**kwargs))
         self.player_factory.register_builder('a2c_discrete', lambda **kwargs : players.PpoPlayerDiscrete(**kwargs))
         self.player_factory.register_builder('sac', lambda **kwargs : players.SACPlayer(**kwargs))
         #self.player_factory.register_builder('dqn', lambda **kwargs : players.DQNPlayer(**kwargs))

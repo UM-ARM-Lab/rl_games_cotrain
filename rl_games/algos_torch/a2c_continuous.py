@@ -133,7 +133,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 [a_loss.unsqueeze(1), c_loss, entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks
             )
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
-
+            
             loss = (
                 a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             )
